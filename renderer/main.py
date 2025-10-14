@@ -57,12 +57,11 @@ class MainRenderer:
             debug.info('Pre-Game State, waiting 1 minute')
             self._draw_pregame()
             t.sleep(60)
-        # tuesday 06h00 UTC until week change
-        elif time.weekday() in [1, 2] or (time.weekday() == 3 and time.hour <= 8):
+        # After Monday night game has ended (Tuesday morning)
+        elif time.weekday() == 1 and time.hour >= 9:
             debug.info('Final State, waiting 6 hours')
             self._draw_post_game()
             # sleep 6 hours
-            # may as well just unplug or turn off tbh
             t.sleep(21600)
         # friday after 00h15 UTC until tuesday 06h00 UTC
         else:
@@ -100,11 +99,39 @@ class MainRenderer:
                 user_name = user_team
             if opp_team and len(opp_team) < 13:
                 opp_name = opp_team
-            game_date_pos = center_text(
-                self.font_mini.getsize(game_date)[0], 32)
-            vs_pos = center_text(self.font_vs.getsize(vs)[0], 32)
-            self.draw.multiline_text((game_date_pos, 0), game_date, fill=(
-                255, 255, 255), font=self.font_mini, align="center")
+            # Abbreviate long names: use only capital letters; if none, use initials
+            def _abbr(name: str, max_len: int = 12) -> str:
+                # Prefer concatenation of capital letters
+                caps = ''.join(c for c in name if c.isupper())
+                if caps:
+                    abbr = caps
+                else:
+                    # If no capitals, use first character of each word (split on spaces/hyphens/underscores)
+                    tokens = name.replace('-', ' ').replace('_', ' ').split()
+                    abbr = ''.join(t[0].upper() for t in tokens if t)
+                # Trim if still too long
+                return abbr[:max_len] if len(abbr) > max_len else abbr
+
+            if len(user_name) > 12:
+                user_name = _abbr(user_name, 12)
+            if len(opp_name) > 12:
+                opp_name = _abbr(opp_name, 12)
+            # Debug: log raw and display names chosen for pregame
+            debug.info("[pregame] raw user_name='%s' opp_name='%s' user_team='%s' opp_team='%s'" % (
+                matchup.get('user_name'), matchup.get('opp_name'), user_team, opp_team))
+            debug.info("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
+            _bbox = self.font_mini.getbbox(game_date)
+            _width = _bbox[2] - _bbox[0]
+            game_date_pos = center_text(_width, 32)
+            vs_bbox = self.font_vs.getbbox(vs)
+            vs_pos = center_text(vs_bbox[2] - vs_bbox[0], 32)
+            self.draw.text(
+                (game_date_pos, 7),  # ensure no clipping of tall glyphs like '6'
+                game_date,
+                fill=(255, 255, 255),
+                font=self.font_mini,
+                align="center"
+            )
             self.draw.multiline_text(
                 (vs_pos + 1, 14), vs, fill=(255, 255, 255), font=self.font_vs, align="center")
             if len(user_name) > 12 or len(opp_name) > 12:
@@ -129,10 +156,12 @@ class MainRenderer:
                 opp_team_logo_pos = {"x": 0, "y": 9}
                 user_team_logo_pos = {"x": 41, "y": 9}
             else:
-                self.draw.multiline_text((0, 6), opp_name, fill=(
-                    255, 255, 255), font=self.font_mini, align="left")
-                self.draw.multiline_text((self.width - self.font_mini.getsize(user_name)[0], self.height - self.font_mini.getsize(
-                    user_name)[1]), user_name, fill=(255, 255, 255), font=self.font_mini, align="left")
+                # Draw abbreviated names on left and right; compute width for proper right alignment
+                opp_text_y = 6
+                self.draw.text((0, opp_text_y), opp_name, fill=(255, 255, 255), font=self.font_mini, align="left")
+                user_bbox = self.font_mini.getbbox(user_name)
+                user_text_width = user_bbox[2] - user_bbox[0]
+                self.draw.text((self.width - user_text_width, opp_text_y), user_name, fill=(255, 255, 255), font=self.font_mini, align="left")
                 # Open the logo image file
                 if self.data.platform == "yahoo":
                     # Open the logo image file
@@ -206,6 +235,41 @@ class MainRenderer:
                 user_colour = (255, 255, 255)
                 matchup = self.data.matchup
                 game_date = 'WEEK {}'.format(self.data.week)
+                # --- Draw team shortnames (live view) ---
+                # Prefer team names if short enough, else abbreviate user/opp names.
+                def _abbr(name: str, max_len: int = 12) -> str:
+                    caps = ''.join(c for c in name if c.isupper())
+                    if caps:
+                        abbr = caps
+                    else:
+                        tokens = name.replace('-', ' ').replace('_', ' ').split()
+                        abbr = ''.join(t[0].upper() for t in tokens if t)
+                    return abbr[:max_len] if len(abbr) > max_len else abbr
+
+                # Pull names from matchup
+                _user_name = matchup.get('user_team') if (matchup.get('user_team') and len(matchup.get('user_team')) < 13) else matchup.get('user_name', '')
+                _opp_name = matchup.get('opp_team') if (matchup.get('opp_team') and len(matchup.get('opp_team')) < 13) else matchup.get('opp_name', '')
+
+                if len(_user_name) > 12:
+                    _user_name = _abbr(_user_name, 12)
+                if len(_opp_name) > 12:
+                    _opp_name = _abbr(_opp_name, 12)
+                # Debug: log names to be drawn in live view
+                debug.info("[live] display user='%s' opp='%s'" % (_user_name, _opp_name))
+
+                # Position names so they don't get covered by logos (logos: left x=0..18, right x=45..63)
+                name_y = 1  # above logos; WEEK text is at y=7 so no overlap vertically
+                # Left (opponent) name to the right of left logo
+                left_x = 19 + 1
+                self.draw.text((left_x, name_y), _opp_name, fill=(255, 255, 255), font=self.font_mini, align="left")
+
+                # Right (user) name left of right logo, right-aligned to x=44
+                user_bbox = self.font_mini.getbbox(_user_name)
+                user_w = user_bbox[2] - user_bbox[0]
+                right_logo_left = 45
+                right_x = max(0, right_logo_left - 1 - user_w)
+                self.draw.text((right_x, name_y), _user_name, fill=(255, 255, 255), font=self.font_mini, align="left")
+                # --- end team shortnames ---
                 # small increase in score
                 if matchup['user_score'] > user_score:
                     user_colour = (165, 200, 50)
@@ -244,12 +308,12 @@ class MainRenderer:
                     abs(opp_score - matchup['opp_score']))
                 user_diff = '{:0.2f}'.format(
                     abs(user_score - matchup['user_score']))
-                opp_big_size = self.font.getsize(str(opp_big))[0]
-                opp_small_size = self.font_mini.getsize(str(opp_small))[0]
-                user_big_size = self.font.getsize(str(user_big))[0]
-                user_small_size = self.font_mini.getsize(str(user_small))[0]
-                user_diff_size = self.font_mini.getsize(user_diff)[0]
-                opp_diff_size = self.font_mini.getsize(opp_diff)[0]
+                opp_big_size = self.font.getbbox(str(opp_big))[2]
+                opp_small_size = self.font_mini.getbbox(str(opp_small))[2]
+                user_big_size = self.font.getbbox(str(user_big))[2]
+                user_small_size = self.font_mini.getbbox(str(user_small))[2]
+                user_diff_size = self.font_mini.getbbox(user_diff)[0]
+                opp_diff_size = self.font_mini.getbbox(opp_diff)[0]
                 # this is bad form I know but idc come at me I'll fix it eventually when I'm not tired and trying random chit
                 opp_big_score = '{}'.format(opp_big)
                 user_big_score = '{}'.format(user_big)
@@ -261,10 +325,17 @@ class MainRenderer:
                     (left_offset, 19), opp_big_score, fill=opp_colour, font=self.font, align="left")
                 self.draw.multiline_text((opp_big_size + left_offset, 19), opp_small_score,
                                          fill=opp_colour, font=self.font_mini, align="left")
-                self.draw.multiline_text((self.width - user_small_size - user_big_size, 19),
-                                         user_big_score, fill=user_colour, font=self.font, align="right")
-                self.draw.multiline_text((self.width - user_small_size, 19), user_small_score,
-                                         fill=user_colour, font=self.font_mini, align="right")
+                user_big_width = self.font.getbbox(str(user_big))[2]
+                user_small_width = self.font_mini.getbbox(str(user_small))[2]
+
+                self.draw.multiline_text(
+                    (self.width - user_small_width - user_big_width, 19),
+                    user_big_score, fill=user_colour, font=self.font, align="left"
+                )
+                self.draw.multiline_text(
+                    (self.width - user_small_width, 19),
+                    user_small_score, fill=user_colour, font=self.font_mini, align="left"
+                )
                 # diffs
                 if abs(opp_score - matchup['opp_score']) > 0:
                     self.draw.multiline_text(
@@ -273,12 +344,46 @@ class MainRenderer:
                     self.draw.multiline_text((self.width - 20 - user_diff_size, 12),
                                              user_diff, fill=user_colour, font=self.font_mini, align="right")
                 # Set the projections on the screen?
-                game_date_pos = center_text(
-                    self.font_mini.getsize(game_date)[0], 32)
-                # score_position = center_text(self.font.getsize(score)[0], 32)
-                # Set the position of each logo on screen.
-                self.draw.multiline_text(
-                    (game_date_pos, -1), game_date, fill=(255, 255, 255), font=self.font_mini, align="center")
+                _bbox = self.font_mini.getbbox(game_date)
+                _width = _bbox[2] - _bbox[0]
+                game_date_pos = center_text(_width, 32)
+                self.draw.text(
+                    (game_date_pos, 7),  # push baseline further down to guarantee top row visible
+                    game_date,
+                    fill=(255, 255, 255),
+                    font=self.font_mini,
+                    align="center"
+                )
+                # --- Projected points difference (user minus opponent), centered under week label ---
+                try:
+                    user_proj = float(matchup.get('user_proj', 0) or 0)
+                    opp_proj = float(matchup.get('opp_proj', 0) or 0)
+                    proj_diff = user_proj - opp_proj
+                    prefix = '+' if proj_diff >= 0 else ''
+                    diff_text = f" {prefix}{proj_diff:.1f}"
+
+                    # Color thresholds: green if > 5, orange if between 5 and 0 (inclusive), red if < 0
+                    if proj_diff > 5:
+                        diff_color = (0, 128, 0)     # green
+                    elif proj_diff >= 0:
+                        diff_color = (255, 165, 0)     # orange
+                    else:
+                        diff_color = (255, 44, 44)     # red
+
+                    diff_bbox = self.font_mini.getbbox(diff_text)
+                    diff_width = diff_bbox[2] - diff_bbox[0]
+                    diff_pos = center_text(diff_width, 32)
+
+                    self.draw.text(
+                        (diff_pos, 14),
+                        diff_text,
+                        fill=diff_color,
+                        font=self.font_mini,
+                        align="center"
+                    )
+                except Exception:
+                    # If parsing fails or keys are missing, silently skip rendering the diff
+                    pass
                 if self.data.platform == "yahoo":
                     # Open the logo image file
                     opp_logo = Image.open(
@@ -354,10 +459,10 @@ class MainRenderer:
                 user_small_score = '{}'.format(user_small)
             else:
                 user_small_score = '{0:02d}'.format(user_small)
-            opp_big_size = self.font.getsize(str(opp_big))[0]
-            opp_small_size = self.font_mini.getsize(str(opp_small))[0]
-            user_big_size = self.font.getsize(str(user_big))[0]
-            user_small_size = self.font_mini.getsize(str(user_small))[0]
+            opp_big_size = self.font.getbbox(str(opp_big))[0]
+            opp_small_size = self.font_mini.getbbox(str(opp_small))[0]
+            user_big_size = self.font.getbbox(str(user_big))[0]
+            user_small_size = self.font_mini.getbbox(str(user_small))[0]
             user_big_score = '{}'.format(user_big)
             opp_big_score = '{}'.format(opp_big)
             # trying to centre them to make it a bit more a e s t h e t i c (essentially adding padding)
@@ -385,14 +490,18 @@ class MainRenderer:
             self.draw.multiline_text((self.width - user_small_size, 19), user_small_score,
                                      fill=user_colour, font=self.font_mini, align="right")
             # Set the position of the information on screen.
-            game_date_pos = center_text(
-                self.font_mini.getsize(game_date)[0], 32)
-            # this was font_mini before, was that on purpose?
-            result_pos = center_text(self.font_res.getsize(result)[0], 32)
-            # result_pos = center_text(self.font_mini.getsize(result)[0], 32)
-            # Draw the text on the Data image.
-            self.draw.multiline_text((game_date_pos, 0), game_date, fill=(
-                255, 255, 255), font=self.font_mini, align="center")
+            _bbox = self.font_mini.getbbox(game_date)
+            _width = _bbox[2] - _bbox[0]
+            game_date_pos = center_text(_width, 32)
+            res_bbox = self.font_res.getbbox(result)
+            result_pos = center_text(res_bbox[2] - res_bbox[0], 32)
+            self.draw.text(
+                (game_date_pos, 7),
+                game_date,
+                fill=(255, 255, 255),
+                font=self.font_mini,
+                align="center"
+            )
             self.draw.multiline_text((result_pos, 9), result, fill=(
                 255, 255, 255), font=self.font_res, align="center")
             # Open the logo image file
@@ -460,11 +569,11 @@ class MainRenderer:
         # Refresh canvas
         # self.image = Image.new('RGB', (self.width, self.height))
         # self.draw = ImageDraw.Draw(self.image)
-        off_pos = center_text(self.font.getsize("OFF")[0], 32)
-        szn_pos = center_text(self.font.getsize("SEASON")[0], 32)
+        off_pos = center_text(self.font.getbbox("OFF")[0], 32)
+        szn_pos = center_text(self.font.getbbox("SEASON")[0], 32)
         self.draw.multiline_text((off_pos, 3), "OFF", fill=(
             255, 255, 255), font=self.font, align="center")
-        self.draw.multiline_text((szn_pos, self.font.getsize("SEASON")[
+        self.draw.multiline_text((szn_pos, self.font.getbbox("SEASON")[
                                  1]+4), "SEASON", fill=(255, 255, 255), font=self.font, align="center")
         self.canvas.SetImage(self.image, 0, 0)
         self.canvas = self.matrix.SwapOnVSync(self.canvas)
@@ -472,10 +581,10 @@ class MainRenderer:
         self.draw = ImageDraw.Draw(self.image)
 
     def _draw_days_until_kickoff(self):
-        off_pos = center_text(self.font.getsize('KICKOFF IN')[0], 32)
-        szn_pos = center_text(self.font.getsize(self.data.start_dt)[0], 32)
+        off_pos = center_text(self.font.getbbox('KICKOFF IN')[0], 32)
+        szn_pos = center_text(self.font.getbbox(self.data.start_dt)[0], 32)
         self.draw.multiline_text((off_pos, 3), 'KICKOFF IN', fill=(
             255, 255, 255), font=self.font, align="center")
-        self.draw.multiline_text((szn_pos, self.font.getsize(self.data.start_dt)[
+        self.draw.multiline_text((szn_pos, self.font.getbbox(self.data.start_dt)[
                                  1]+4), self.data.start_dt, fill=(255, 255, 255), font=self.font, align="center")
         self._refresh_image()
