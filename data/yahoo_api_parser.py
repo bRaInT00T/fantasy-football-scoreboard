@@ -182,14 +182,14 @@ class YahooFantasyInfo():
                         if is_user_team:
                             matchup_info['user_name'] = nickname
                             matchup_info['user_av'] = nickname
-                            matchup_info['user_av_location'] = image_url or logo_url
+                            matchup_info['user_av_location'] = logo_url or image_url
                             matchup_info['user_team'] = team_name
                             matchup_info['user_proj'] = projected_points
                             matchup_info['user_score'] = float(actual_points)
                         else:
                             matchup_info['opp_name'] = nickname
                             matchup_info['opp_av'] = nickname
-                            matchup_info['opp_av_location'] = image_url or logo_url
+                            matchup_info['opp_av_location'] = logo_url or image_url
                             matchup_info['opp_team'] = team_name
                             matchup_info['opp_proj'] = projected_points
                             matchup_info['opp_score'] = float(actual_points)
