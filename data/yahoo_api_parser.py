@@ -6,8 +6,6 @@ import os
 import json
 from yahoo_oauth import OAuth2
 
-# https://fantasysports.yahooapis.com/fantasy/v2/games;game_codes=nfl I'm almost positive this is how to find the game id (406) but I totally forget now
-
 
 class YahooFantasyInfo():
     def __init__(self, yahoo_consumer_key, yahoo_consumer_secret, game_id, league_id, team_id, week):
@@ -17,7 +15,7 @@ class YahooFantasyInfo():
         self.week = week
         self.auth_info = {"consumer_key": yahoo_consumer_key,
                           "consumer_secret": yahoo_consumer_secret}
-
+        
         authpath = os.path.abspath(os.path.join(
             os.path.dirname(__file__), '..', 'auth'))
         if not os.path.exists(authpath):
@@ -50,6 +48,62 @@ class YahooFantasyInfo():
         self.matchup = self.get_matchup(
             self.game_id, self.league_id, self.team_id, week)
         self.get_avatars(self.matchup)
+
+    def get_league_teams_config(self, output_file="teams_config.json"):
+        """Fetch all teams in the league and save their info to a config JSON file."""
+        self.refresh_access_token()
+        url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{self.game_id}.l.{self.league_id}/teams"
+        resp = self.oauth.session.get(url, params={'format': 'json'})
+        if resp.status_code != 200:
+            raise RuntimeError(f"Yahoo /teams error {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+
+        teams_config = {"teams": []}
+        teams_data = data.get("fantasy_content", {}).get("games", {}).get("game", {}).get("0", {}).get("teams", {})
+        # teams_data = data["fantasy_content"]["league"][1]["teams"]
+
+        for t in teams_data.values():
+            if isinstance(t, int):
+                continue
+            team = t["team"]
+            # Extract info
+            team_id = None
+            team_name = None
+            team_logo = ""
+            manager_entry = {}
+
+            for item in team:
+                if isinstance(item, dict):
+                    if "team_key" in item:
+                        # last part after '.t.' is team_id
+                        team_id = int(item["team_key"].split(".t.")[-1])
+                    elif "name" in item:
+                        team_name = item["name"]
+                    elif "team_logos" in item:
+                        team_logo = item["team_logos"][0]["team_logo"]["url"]
+                    elif "managers" in item:
+                        manager_entry = item["managers"][0]["manager"]
+
+            teams_config["teams"].append({
+                "team_id": team_id,
+                "team_name": team_name,
+                "manager": {
+                    "first_name": manager_entry.get("first_name", ""),
+                    "last_name": manager_entry.get("last_name", ""),
+                    "nickname": manager_entry.get("nickname", "")
+                },
+                "team_logo": team_logo,
+                "short_name": ""  # you can fill this manually later
+            })
+
+        # Write to file
+        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', output_file))
+        with open(config_path, "w") as f:
+            json.dump(teams_config, f, indent=2)
+        print(f"✅ Saved team info to {config_path}")
+
+        return teams_config
+
     def get_game_id_for_season(self, season: int = None):
         """
         Return the numeric Yahoo NFL game_key for the given season (defaults to current year).
@@ -180,14 +234,24 @@ class YahooFantasyInfo():
                         )
 
                         if is_user_team:
-                            matchup_info['user_name'] = nickname
+                            first = manager.get('first_name', '')
+                            last = manager.get('last_name', '')
+                            full_name = f"{first} {last}".strip()
+                            if not full_name:
+                                full_name = nickname
+                            matchup_info['user_name'] = full_name
                             matchup_info['user_av'] = nickname
                             matchup_info['user_av_location'] = logo_url or image_url
                             matchup_info['user_team'] = team_name
                             matchup_info['user_proj'] = projected_points
                             matchup_info['user_score'] = float(actual_points)
                         else:
-                            matchup_info['opp_name'] = nickname
+                            first = manager.get('first_name', '')
+                            last = manager.get('last_name', '')
+                            full_name = f"{first} {last}".strip()
+                            if not full_name:
+                                full_name = nickname
+                            matchup_info['opp_name'] = full_name
                             matchup_info['opp_av'] = nickname
                             matchup_info['opp_av_location'] = logo_url or image_url
                             matchup_info['opp_team'] = team_name

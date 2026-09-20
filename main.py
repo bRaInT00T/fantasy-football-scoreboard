@@ -10,6 +10,9 @@ import os
 import sys
 import shlex
 import json
+import logging
+
+logging.getLogger("yahoo_oauth").setLevel(logging.WARNING)
 
 # --- Default CLI arguments injection ---
 # 1) Read default LED args from config.json (section: "matrix" or "led")
@@ -84,7 +87,7 @@ config = ScoreboardConfig("config", args)
 
 
 SCRIPT_NAME = "Fantasy Football Scoreboard"
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 # Get supplied command line arguments
 
