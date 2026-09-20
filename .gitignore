@@ -1,10 +1,26 @@
+# Credentials - never commit these
+config.json
+config copy*.json
+auth/
+*.token.json
+token.json
+
+# Created by venv; see https://docs.python.org/3/library/venv.html
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
 /logos
 /testing
 *_config.json
 __pycache__/
 *.py[cod]
 *$py.class
+*.swp
+*.swo
 matrix/
-config.json
 /submodules
 .DS_Store
