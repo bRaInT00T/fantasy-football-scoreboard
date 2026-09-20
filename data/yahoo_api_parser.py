@@ -1,10 +1,19 @@
 import requests
 from datetime import datetime
-# from utils import convert_time
 import os
-# import debug
+import debug
 import json
 from yahoo_oauth import OAuth2
+
+
+class YahooAPIError(Exception):
+    pass
+
+
+def _describe_error(response, body):
+    description = (body.get("error") or {}).get("description", "").strip()
+    return "Yahoo API returned {0}: {1}".format(
+        response.status_code, description or response.text[:200].strip())
 
 
 class YahooFantasyInfo():
@@ -179,17 +188,31 @@ class YahooFantasyInfo():
 
     # yeah these two are stupid and useless functions but right now I'm panicking trying to get this to work
     def refresh_matchup(self):
-        return self.get_matchup(self.game_id, self.league_id, self.team_id, self.week)
+        return self._refresh()
 
     def refresh_scores(self):
-        return self.get_matchup(self.game_id, self.league_id, self.team_id, self.week)
+        return self._refresh()
+
+    def _refresh(self):
+        try:
+            self.matchup = self.get_matchup(
+                self.game_id, self.league_id, self.team_id, self.week)
+        except YahooAPIError as error:
+            # A refresh failure shouldn't take the board down mid-game
+            debug.error("{0} - keeping last known scores".format(error))
+        return self.matchup
 
     def get_matchup(self, game_id, league_id, team_id, week):
         self.refresh_access_token()
         url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{self.game_id}.l.{self.league_id}.t.{self.team_id}/matchups;weeks={week}"
         response = self.oauth.session.get(url, params={'format': 'json'})
-        data = response.json()
-        # print(json.dumps(data, indent=2))  # Uncomment for debugging
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+
+        if "fantasy_content" not in data:
+            raise YahooAPIError(_describe_error(response, data))
 
         matchup = data["fantasy_content"]["team"][1]["matchups"]
         matchup_info = {}
@@ -262,7 +285,7 @@ class YahooFantasyInfo():
 
     def get_avatars(self, teams):
         self.refresh_access_token()
-        # debug.info('getting avatars')
+        debug.info('getting avatars')
         logospath = os.path.abspath(os.path.join(
             os.path.dirname(__file__), '..', 'logos'))
         if not os.path.exists(logospath):
@@ -274,7 +297,7 @@ class YahooFantasyInfo():
     def get_avatar(self, logospath, name, url):
         filename = os.path.join(logospath, '{0}.jpg'.format(name))
         if not os.path.exists(filename):
-            # debug.info('downloading avatar for {0}'.format(name))
+            debug.info('downloading avatar for {0}'.format(name))
             r = requests.get(url, stream=True)
             with open(filename, 'wb') as fd:
                 for chunk in r.iter_content(chunk_size=128):
