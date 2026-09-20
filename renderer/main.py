@@ -65,12 +65,12 @@ class MainRenderer:
             t.sleep(21600)
         # friday after 00h15 UTC until tuesday 06h00 UTC
         else:
-            debug.info('Live State, checking every 10s')
+            debug.log('Live State, checking every 10s')
             # Draw the current game
             self._draw_game()
 
     def __render_off_season(self):
-        debug.info('ping_off_season')
+        debug.log('ping_off_season')
         self._draw_off_season()
         t.sleep(86400)  # sleep 24 hours
 
@@ -117,9 +117,9 @@ class MainRenderer:
             if len(opp_name) > 12:
                 opp_name = _abbr(opp_name, 12)
             # Debug: log raw and display names chosen for pregame
-            debug.info("[pregame] raw user_name='%s' opp_name='%s' user_team='%s' opp_team='%s'" % (
+            debug.log("[pregame] raw user_name='%s' opp_name='%s' user_team='%s' opp_team='%s'" % (
                 matchup.get('user_name'), matchup.get('opp_name'), user_team, opp_team))
-            debug.info("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
+            debug.log("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
             _bbox = self.font_mini.getbbox(game_date)
             _width = _bbox[2] - _bbox[0]
             game_date_pos = center_text(_width, 32)
@@ -220,7 +220,7 @@ class MainRenderer:
         while True:
             # Refresh the data
             if self.data.needs_refresh and self.data.check_scores:
-                debug.info('Refresh game matchup')
+                debug.log('Refresh game matchup')
                 extra_sleep = 0
                 self.data.refresh_scores()
                 self.data.needs_refresh = False
@@ -255,7 +255,28 @@ class MainRenderer:
                 if len(_opp_name) > 12:
                     _opp_name = _abbr(_opp_name, 12)
                 # Debug: log names to be drawn in live view
-                debug.info("[live] display user='%s' opp='%s'" % (_user_name, _opp_name))
+                debug.log("[live] display user='%s' opp='%s'" % (_user_name, _opp_name))
+
+                # --- Auto-fit or abbreviate team names to display width (~26px per side) ---
+                def _fit_name(name: str, font, max_width: int) -> str:
+                    """Abbreviate or trim a name until it fits within the given pixel width."""
+                    # Prefer capital-letter abbreviation (same as _abbr logic)
+                    caps = ''.join(c for c in name if c.isupper())
+                    if caps:
+                        abbr = caps
+                    else:
+                        tokens = name.replace('-', ' ').replace('_', ' ').split()
+                        abbr = ''.join(t[0].upper() for t in tokens if t)
+                    # If abbreviation is still too wide, progressively shorten
+                    if font.getbbox(abbr)[2] <= max_width:
+                        return abbr
+                    while font.getbbox(abbr)[2] > max_width and len(abbr) > 1:
+                        abbr = abbr[:-1]
+                    return abbr
+
+                _opp_name = _fit_name(_opp_name, self.font_mini, 26)
+                _user_name = _fit_name(_user_name, self.font_mini, 26)
+                # --- End auto-fit ---
 
                 # Position names so they don't get covered by logos (logos: left x=0..18, right x=45..63)
                 name_y = 1  # above logos; WEEK text is at y=7 so no overlap vertically
@@ -282,6 +303,7 @@ class MainRenderer:
                     opp_colour = (175, 25, 25)
                 # big play! 5+ points for someone, turn it gold
                 if matchup.get('user_score', 0) > (user_score + 5) or matchup.get('opp_score', 0) > (opp_score + 5):
+                    debug.info("BIG PLAY ANIMATION DRAWN")
                     self._draw_big_play()
                 if matchup['user_score'] > user_score + 5:
                     user_colour = (255, 215, 0)
@@ -549,21 +571,22 @@ class MainRenderer:
         im = Image.open("Assets/big_play_animation.gif")
         # Set the frame index to 0
         frameNo = 0
-        self.canvas.Clear()
         # Go through the frames
         play = True
-        # I think this code was originally made to repeat the gif 5 times, but I need to test it
-        # thus the stupid
-        # also, it works, so why break it when I'm literally learning python by the seat of my pants?
+        # Overlay the GIF frames over the existing canvas without clearing
         while play:
             try:
                 im.seek(frameNo)
             except EOFError:
                 play = False
-            self.canvas.SetImage(im.convert('RGB'), 0, 0)
+                break
+            frame = im.convert('RGBA')
+            bg_image = Image.new('RGBA', (self.width, self.height))
+            bg_image.paste(frame, (0, 0), frame)  # overlay alpha channel
+            self.canvas.SetImage(bg_image.convert('RGB'), 0, 0)
             self.canvas = self.matrix.SwapOnVSync(self.canvas)
             frameNo += 1
-            t.sleep(0.02)
+            t.sleep(0.05)
 
     def _draw_off_season(self):
         # Refresh canvas
@@ -587,4 +610,4 @@ class MainRenderer:
             255, 255, 255), font=self.font, align="center")
         self.draw.multiline_text((szn_pos, self.font.getbbox(self.data.start_dt)[
                                  1]+4), self.data.start_dt, fill=(255, 255, 255), font=self.font, align="center")
-        self._refresh_image()
+        # self._refresh_image()
