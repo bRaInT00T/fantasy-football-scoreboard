@@ -22,6 +22,12 @@ class ScoreboardConfig:
         self.yahoo_league_id = json["yahoo"]["league_id"]
         self.yahoo_team_id = json["yahoo"]["team_id"]
 
+        # Absent from configs written before this existed, so default it
+        sleep = json.get("sleep", {})
+        self.sleep_enabled = sleep.get("enabled", True)
+        self.sleep_after_hours = sleep.get("sleep_after_hours", 12)
+        self.wake_before_hours = sleep.get("wake_before_hours", 1)
+
         self.espn_s2 = json["espn"]["espn_s2"]
         self.espn_swid = json["espn"]["swid"]
         self.espn_team_id = json["espn"]["team_id"]

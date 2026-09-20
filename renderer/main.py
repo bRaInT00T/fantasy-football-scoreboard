@@ -7,6 +7,9 @@ import debug
 from pprint import pprint
 import math
 
+# Cap each nap so a flexed or rescheduled game is still picked up
+STANDBY_MAX_NAP = 21600
+
 
 class MainRenderer:
     def __init__(self, matrix, data):
@@ -19,6 +22,7 @@ class MainRenderer:
         self.avsize = 19
         # use this to check if week has changed
         self.week = data.week
+        self._in_standby = False
         # Create a new data image.
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
@@ -38,8 +42,58 @@ class MainRenderer:
                 debug.info('Off season state')
                 self.__render_off_season()
 
+    def _draw_standby(self, kickoff):
+        local = kickoff.astimezone()
+        label = 'NEXT: {0} {1}:{2:02d}{3}'.format(
+            local.strftime('%a').upper(),
+            local.hour % 12 or 12,
+            local.minute,
+            'AM' if local.hour < 12 else 'PM')
+        self.image = Image.new('RGB', (self.width, self.height))
+        self.draw = ImageDraw.Draw(self.image)
+        pos = center_text(self.font_mini.getbbox(label)[2], 32)
+        self.draw.multiline_text((pos, 12), label, fill=(
+            110, 110, 110), font=self.font_mini, align="center")
+        self.canvas.SetImage(self.image, 0, 0)
+        self.canvas = self.matrix.SwapOnVSync(self.canvas)
+
+    def _standby(self):
+        config = self.data.config
+        if not config.sleep_enabled:
+            self._in_standby = False
+            return False
+        upcoming = self.data.next_kickoff()
+        # Unknown schedule: stay awake rather than risk sleeping through a game
+        if upcoming is None:
+            self._in_standby = False
+            return False
+        seconds, kickoff = upcoming
+        # Takes a long gap to drop into standby, but once there it stays until
+        # just before kickoff - otherwise it would wake a full sleep_after
+        # ahead of the game and wake_before_hours would never apply
+        threshold = (config.wake_before_hours if self._in_standby
+                     else config.sleep_after_hours)
+        if seconds < threshold * 3600:
+            self._in_standby = False
+            return False
+        nap = min(seconds - config.wake_before_hours * 3600, STANDBY_MAX_NAP)
+        if nap <= 0:
+            self._in_standby = False
+            return False
+        self._in_standby = True
+        debug.info('Standby, next kickoff in {0:.1f}h, sleeping {1:.1f}h'.format(
+            seconds / 3600, nap / 3600))
+        self._draw_standby(kickoff)
+        t.sleep(nap)
+        # A nap can outlast the current week
+        self.data.refresh_week()
+        self.week = self.data.week
+        return True
+
     # TODO: figure out a more programmatic way of handling this in refactor
     def __render_game(self):
+        if self._standby():
+            return
         debug.info('ping render_game')
         time = self.data.get_current_date()
         # for the days after preseason ends, but there's still a lot of time before the season starts

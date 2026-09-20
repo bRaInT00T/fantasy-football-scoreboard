@@ -15,7 +15,12 @@
         "consumer_secret": "",
         "team_id": "",
         "league_id": "",
-        "game_id": "414"
+        "game_id": "nfl"
+    },
+    "sleep": {
+        "enabled": true,
+        "sleep_after_hours": 12,
+        "wake_before_hours": 1
     },
     "debug": false,
     "testing": false

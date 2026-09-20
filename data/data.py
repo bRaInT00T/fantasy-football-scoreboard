@@ -53,6 +53,45 @@ class Data:
         week_info = requests.get(API_URL).json()
         return week_info['week']['number']
 
+    def refresh_week(self):
+        self.week = self.get_week()
+        self.api.week = self.week
+
+    def _scoreboard_events(self, week=None):
+        url = API_URL if week is None else '{0}?week={1}'.format(API_URL, week)
+        return requests.get(url).json().get('events', [])
+
+    @staticmethod
+    def _event_state(event):
+        return event['status']['type']['state']
+
+    @staticmethod
+    def _earliest_kickoff(events):
+        times = [datetime.fromisoformat(e['date'].replace('Z', '+00:00'))
+                 for e in events if Data._event_state(e) == 'pre']
+        return min(times) if times else None
+
+    def next_kickoff(self):
+        # (0, None) while a game is in progress. None means the schedule is
+        # unknown, and the caller should stay awake rather than risk sleeping
+        # through a game.
+        try:
+            events = self._scoreboard_events()
+            if any(self._event_state(e) == 'in' for e in events):
+                return (0, None)
+            kickoff = self._earliest_kickoff(events)
+            if kickoff is None:
+                kickoff = self._earliest_kickoff(
+                    self._scoreboard_events(self.week + 1))
+            if kickoff is None:
+                return None
+        except Exception as error:
+            debug.warning(
+                'could not determine next kickoff: {0}'.format(error))
+            return None
+        delta = (kickoff - datetime.now(timezone.utc)).total_seconds()
+        return (max(0, delta), kickoff)
+
     def get_current_date(self):
         # pretty dumb function but whatever
         return datetime.now(timezone.utc)
