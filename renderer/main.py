@@ -9,6 +9,9 @@ import math
 
 # Cap each nap so a flexed or rescheduled game is still picked up
 STANDBY_MAX_NAP = 21600
+# Seconds per pixel of name scrolling, and blank pixels between repeats
+SCROLL_STEP = 0.06
+SCROLL_GAP = 12
 
 
 class MainRenderer:
@@ -31,6 +34,51 @@ class MainRenderer:
         self.font_mini = ImageFont.truetype("fonts/04B_24__.TTF", 8)
         self.font_vs = ImageFont.truetype("fonts/CG pixel 3x5.ttf", 10)
         self.font_res = ImageFont.truetype("fonts/CG pixel 3x5.ttf", 6)
+        # Names too wide for their box, animated by _hold()
+        self._scrollers = []
+        self._scroll_tick = 0
+        self._frame = None
+
+    @staticmethod
+    def _display_name(matchup, side):
+        # Team name first; the owner only when the platform gave no team name
+        return (matchup.get(side + '_team') or matchup.get(side + '_name') or '').strip()
+
+    def _place_text(self, text, font, x, y, width, align='left'):
+        """Draw text in a box of the given width, or queue it to scroll if it won't fit."""
+        text_w = font.getbbox(text)[2] if text else 0
+        if text_w <= width:
+            dx = width - text_w if align == 'right' else 0
+            self.draw.text((x + dx, y), text, fill=(255, 255, 255), font=font)
+            return
+        strip = Image.new('RGB', (text_w + SCROLL_GAP, font.getbbox(text)[3]))
+        ImageDraw.Draw(strip).text((0, 0), text, fill=(255, 255, 255), font=font)
+        self._scrollers.append((strip, x, y, width))
+
+    def _show(self, image):
+        self.canvas.SetImage(image, 0, 0)
+        self.canvas = self.matrix.SwapOnVSync(self.canvas)
+
+    def _hold(self, seconds):
+        """Keep the last frame up for `seconds`, scrolling any names that didn't fit."""
+        if not self._scrollers or self._frame is None:
+            self._scrollers = []
+            t.sleep(seconds)
+            return
+        end = t.time() + seconds
+        while t.time() < end:
+            frame = self._frame.copy()
+            for strip, x, y, width in self._scrollers:
+                offset = self._scroll_tick % strip.width
+                window = Image.new('RGB', (width, strip.height))
+                window.paste(strip, (-offset, 0))
+                window.paste(strip, (strip.width - offset, 0))
+                # Mask on lit pixels so the window never blanks what's underneath
+                frame.paste(window, (x, y), window.convert('L'))
+            self._show(frame)
+            self._scroll_tick += 1
+            t.sleep(SCROLL_STEP)
+        self._scrollers = []
 
     def render(self):
         while True:
@@ -100,17 +148,17 @@ class MainRenderer:
         if self.data.get_season_type() == 'kickoff':
             debug.info('Pre-Kickoff State, waiting 6 hours')
             self._draw_pregame()
-            t.sleep(21600)
+            self._hold(21600)
         # check if thursday and before 16h00 UTC (fixed for US Thanksgiving games)
         elif time.weekday() == 3 and 9 <= time.hour <= 15 and time.minute <= 59:
             debug.info('Pre-Game State, waiting 15 min')
             self._draw_pregame()
-            t.sleep(900)
+            self._hold(900)
         # thursday before 17h00 UTC
         elif time.weekday() == 3 and time.hour == 16 and time.minute <= 29:
             debug.info('Pre-Game State, waiting 1 minute')
             self._draw_pregame()
-            t.sleep(60)
+            self._hold(60)
         # After Monday night game has ended (Tuesday morning)
         elif time.weekday() == 1 and time.hour >= 9:
             debug.info('Final State, waiting 6 hours')
@@ -144,36 +192,6 @@ class MainRenderer:
             week = self.data.week
             game_date = 'WEEK {}'.format(week)
             vs = 'VS'
-            user_name = matchup['user_name']
-            opp_name = matchup['opp_name']
-            user_team = matchup.get('user_team')
-            opp_team = matchup.get('opp_team')
-            # choose team names that fit
-            if user_team and len(user_team) < 13:
-                user_name = user_team
-            if opp_team and len(opp_team) < 13:
-                opp_name = opp_team
-            # Abbreviate long names: use only capital letters; if none, use initials
-            def _abbr(name: str, max_len: int = 12) -> str:
-                # Prefer concatenation of capital letters
-                caps = ''.join(c for c in name if c.isupper())
-                if caps:
-                    abbr = caps
-                else:
-                    # If no capitals, use first character of each word (split on spaces/hyphens/underscores)
-                    tokens = name.replace('-', ' ').replace('_', ' ').split()
-                    abbr = ''.join(t[0].upper() for t in tokens if t)
-                # Trim if still too long
-                return abbr[:max_len] if len(abbr) > max_len else abbr
-
-            if len(user_name) > 12:
-                user_name = _abbr(user_name, 12)
-            if len(opp_name) > 12:
-                opp_name = _abbr(opp_name, 12)
-            # Debug: log raw and display names chosen for pregame
-            debug.log("[pregame] raw user_name='%s' opp_name='%s' user_team='%s' opp_team='%s'" % (
-                matchup.get('user_name'), matchup.get('opp_name'), user_team, opp_team))
-            debug.log("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
             _bbox = self.font_mini.getbbox(game_date)
             _width = _bbox[2] - _bbox[0]
             game_date_pos = center_text(_width, 32)
@@ -188,64 +206,34 @@ class MainRenderer:
             )
             self.draw.multiline_text(
                 (vs_pos + 1, 14), vs, fill=(255, 255, 255), font=self.font_vs, align="center")
-            if len(user_name) > 12 or len(opp_name) > 12:
-                if self.data.platform == "yahoo":
-                    # Open the logo image file
-                    opp_logo = Image.open(
-                        'logos/{}.jpg'.format(opp_av)).resize((23, 23), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}.jpg'.format(user_av)).resize((23, 23), Image.BOX)
-                elif self.data.platform == "espn":
-                    opp_logo = Image.open(
-                        'logos/{}'.format(opp_av)).resize((23, 23), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}'.format(user_av)).resize((23, 23), Image.BOX)
-                else:
-                    # try png for sleeper
-                    opp_logo = Image.open(
-                        'logos/{}.png'.format(opp_av)).resize((23, 23), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}.png'.format(user_av)).resize((23, 23), Image.BOX)
-                # Set the position of each logo on screen.
-                opp_team_logo_pos = {"x": 0, "y": 9}
-                user_team_logo_pos = {"x": 41, "y": 9}
-            else:
-                # Draw abbreviated names on left and right; compute width for proper right alignment
-                opp_text_y = 6
-                self.draw.text((0, opp_text_y), opp_name, fill=(255, 255, 255), font=self.font_mini, align="left")
-                user_bbox = self.font_mini.getbbox(user_name)
-                user_text_width = user_bbox[2] - user_bbox[0]
-                self.draw.text((self.width - user_text_width, opp_text_y), user_name, fill=(255, 255, 255), font=self.font_mini, align="left")
+            # Each name gets half of the top row, clear of the WEEK label and logos
+            opp_name = self._display_name(matchup, 'opp')
+            user_name = self._display_name(matchup, 'user')
+            debug.log("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
+            self._place_text(opp_name, self.font_mini, 0, 1, 30)
+            self._place_text(user_name, self.font_mini, 34, 1, 30, align='right')
+            if self.data.platform == "yahoo":
                 # Open the logo image file
-                if self.data.platform == "yahoo":
-                    # Open the logo image file
-                    opp_logo = Image.open(
-                        'logos/{}.jpg'.format(opp_av)).resize((19, 19), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}.jpg'.format(user_av)).resize((19, 19), Image.BOX)
-                elif self.data.platform == "espn":
-                    opp_logo = Image.open(
-                        'logos/{}'.format(opp_av)).resize((19, 19), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}'.format(user_av)).resize((19, 19), Image.BOX)
-                else:
-                    # try png for sleeper
-                    opp_logo = Image.open(
-                        'logos/{}.png'.format(opp_av)).resize((19, 19), Image.BOX)
-                    user_logo = Image.open(
-                        'logos/{}.png'.format(user_av)).resize((19, 19), Image.BOX)
-                # Set the position of each logo on screen.
-                opp_team_logo_pos = {"x": 0, "y": 13}
-                user_team_logo_pos = {"x": 45, "y": 7}
-            # Put the data on the canvas
-            self.canvas.SetImage(self.image, 0, 0)
-            # Put the images on the canvas
-            self.canvas.SetImage(opp_logo.convert(
-                "RGB"), opp_team_logo_pos["x"], opp_team_logo_pos["y"])
-            self.canvas.SetImage(user_logo.convert(
-                "RGB"), user_team_logo_pos["x"], user_team_logo_pos["y"])
-            # Load the canvas on screen.
-            self.canvas = self.matrix.SwapOnVSync(self.canvas)
+                opp_logo = Image.open(
+                    'logos/{}.jpg'.format(opp_av)).resize((19, 19), Image.BOX)
+                user_logo = Image.open(
+                    'logos/{}.jpg'.format(user_av)).resize((19, 19), Image.BOX)
+            elif self.data.platform == "espn":
+                opp_logo = Image.open(
+                    'logos/{}'.format(opp_av)).resize((19, 19), Image.BOX)
+                user_logo = Image.open(
+                    'logos/{}'.format(user_av)).resize((19, 19), Image.BOX)
+            else:
+                # try png for sleeper
+                opp_logo = Image.open(
+                    'logos/{}.png'.format(opp_av)).resize((19, 19), Image.BOX)
+                user_logo = Image.open(
+                    'logos/{}.png'.format(user_av)).resize((19, 19), Image.BOX)
+            # Composite the logos into the frame so _hold() can redraw it
+            self.image.paste(opp_logo.convert("RGB"), (0, 13))
+            self.image.paste(user_logo.convert("RGB"), (45, 7))
+            self._frame = self.image
+            self._show(self._frame)
             # Refresh the Data image.
             self.image = Image.new('RGB', (self.width, self.height))
             self.draw = ImageDraw.Draw(self.image)
@@ -289,62 +277,21 @@ class MainRenderer:
                 user_colour = (255, 255, 255)
                 matchup = self.data.matchup
                 game_date = 'WEEK {}'.format(self.data.week)
-                # --- Draw team shortnames (live view) ---
-                # Prefer team names if short enough, else abbreviate user/opp names.
-                def _abbr(name: str, max_len: int = 12) -> str:
-                    caps = ''.join(c for c in name if c.isupper())
-                    if caps:
-                        abbr = caps
-                    else:
-                        tokens = name.replace('-', ' ').replace('_', ' ').split()
-                        abbr = ''.join(t[0].upper() for t in tokens if t)
-                    return abbr[:max_len] if len(abbr) > max_len else abbr
-
-                # Pull names from matchup
-                _user_name = matchup.get('user_team') if (matchup.get('user_team') and len(matchup.get('user_team')) < 13) else matchup.get('user_name', '')
-                _opp_name = matchup.get('opp_team') if (matchup.get('opp_team') and len(matchup.get('opp_team')) < 13) else matchup.get('opp_name', '')
-
-                if len(_user_name) > 12:
-                    _user_name = _abbr(_user_name, 12)
-                if len(_opp_name) > 12:
-                    _opp_name = _abbr(_opp_name, 12)
-                # Debug: log names to be drawn in live view
+                # --- Team names (live view) ---
+                # Both share the gap between the logos (x=20..44) on the top row
+                _opp_name = self._display_name(matchup, 'opp')
+                _user_name = self._display_name(matchup, 'user')
                 debug.log("[live] display user='%s' opp='%s'" % (_user_name, _opp_name))
-
-                # --- Auto-fit or abbreviate team names to display width (~26px per side) ---
-                def _fit_name(name: str, font, max_width: int) -> str:
-                    """Abbreviate or trim a name until it fits within the given pixel width."""
-                    # Prefer capital-letter abbreviation (same as _abbr logic)
-                    caps = ''.join(c for c in name if c.isupper())
-                    if caps:
-                        abbr = caps
-                    else:
-                        tokens = name.replace('-', ' ').replace('_', ' ').split()
-                        abbr = ''.join(t[0].upper() for t in tokens if t)
-                    # If abbreviation is still too wide, progressively shorten
-                    if font.getbbox(abbr)[2] <= max_width:
-                        return abbr
-                    while font.getbbox(abbr)[2] > max_width and len(abbr) > 1:
-                        abbr = abbr[:-1]
-                    return abbr
-
-                _opp_name = _fit_name(_opp_name, self.font_mini, 26)
-                _user_name = _fit_name(_user_name, self.font_mini, 26)
-                # --- End auto-fit ---
-
-                # Position names so they don't get covered by logos (logos: left x=0..18, right x=45..63)
-                name_y = 1  # above logos; WEEK text is at y=7 so no overlap vertically
-                # Left (opponent) name to the right of left logo
-                left_x = 19 + 1
-                self.draw.text((left_x, name_y), _opp_name, fill=(255, 255, 255), font=self.font_mini, align="left")
-
-                # Right (user) name left of right logo, right-aligned to x=44
-                user_bbox = self.font_mini.getbbox(_user_name)
-                user_w = user_bbox[2] - user_bbox[0]
-                right_logo_left = 45
-                right_x = max(0, right_logo_left - 1 - user_w)
-                self.draw.text((right_x, name_y), _user_name, fill=(255, 255, 255), font=self.font_mini, align="left")
-                # --- end team shortnames ---
+                name_x, name_y, name_w = 20, 1, 25
+                opp_w = self.font_mini.getbbox(_opp_name)[2] if _opp_name else 0
+                user_w = self.font_mini.getbbox(_user_name)[2] if _user_name else 0
+                if opp_w + user_w + 3 <= name_w:
+                    self._place_text(_opp_name, self.font_mini, name_x, name_y, name_w)
+                    self._place_text(_user_name, self.font_mini, name_x, name_y, name_w, align='right')
+                else:
+                    self._place_text('{0} VS {1}'.format(_opp_name, _user_name),
+                                     self.font_mini, name_x, name_y, name_w)
+                # --- end team names ---
                 # small increase in score
                 if matchup['user_score'] > user_score:
                     user_colour = (165, 200, 50)
@@ -477,18 +424,11 @@ class MainRenderer:
                         'logos/{}.png'.format(opp_av)).resize((19, 19), Image.BOX)
                     user_logo = Image.open(
                         'logos/{}.png'.format(user_av)).resize((19, 19), Image.BOX)
-                # Set the position of each logo on screen.
-                opp_team_logo_pos = {"x": 0, "y": 0}
-                user_team_logo_pos = {"x": 45, "y": 0}
-                # Put the data on the canvas
-                self.canvas.SetImage(self.image, 0, 0)
-                # Put the images on the canvas
-                self.canvas.SetImage(opp_logo.convert(
-                    "RGB"), opp_team_logo_pos["x"], opp_team_logo_pos["y"])
-                self.canvas.SetImage(user_logo.convert(
-                    "RGB"), user_team_logo_pos["x"], user_team_logo_pos["y"])
-                # Load the canvas on screen.
-                self.canvas = self.matrix.SwapOnVSync(self.canvas)
+                # Composite the logos into the frame so _hold() can redraw it
+                self.image.paste(opp_logo.convert("RGB"), (0, 0))
+                self.image.paste(user_logo.convert("RGB"), (45, 0))
+                self._frame = self.image
+                self._show(self._frame)
                 # Refresh the Data image.
                 self.image = Image.new('RGB', (self.width, self.height))
                 self.draw = ImageDraw.Draw(self.image)
@@ -496,7 +436,7 @@ class MainRenderer:
                 opp_score = matchup['opp_score']
                 user_score = matchup['user_score']
                 self.data.needs_refresh = True
-                t.sleep(10 + extra_sleep)
+                self._hold(10 + extra_sleep)
             else:
                 # this doesn't work lul need 2 fix
                 # (Need to make the screen run on it's own) If connection to the API fails, show bottom red line and refresh in 30s.
