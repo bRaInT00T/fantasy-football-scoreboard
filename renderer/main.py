@@ -12,6 +12,16 @@ STANDBY_MAX_NAP = 21600
 # Seconds per pixel of name scrolling, and blank pixels between repeats
 SCROLL_STEP = 0.06
 SCROLL_GAP = 12
+# Seconds to show the abbreviation after each full scroll
+SCROLL_PAUSE = 6
+# Other league games: seconds on your matchup between looks at them, how long
+# the list stays up, and how long it flashes up when one of those scores changes
+LEAGUE_EVERY = 30
+LEAGUE_SHOW = 8
+LEAGUE_FLASH = 5
+# How often to ask ESPN whether the week's last game is over, and the flash then
+WEEK_CHECK_EVERY = 60
+WEEK_OVER_FLASHES = 5
 
 
 class MainRenderer:
@@ -34,26 +44,131 @@ class MainRenderer:
         self.font_mini = ImageFont.truetype("fonts/04B_24__.TTF", 8)
         self.font_vs = ImageFont.truetype("fonts/CG pixel 3x5.ttf", 10)
         self.font_res = ImageFont.truetype("fonts/CG pixel 3x5.ttf", 6)
+        # Live-view scores, small enough to fit under the logos (score_large blurs this small)
+        self.font_score = ImageFont.truetype("fonts/04B_03B_.TTF", 8)
         # Names too wide for their box, animated by _hold()
         self._scrollers = []
         self._scroll_tick = 0
         self._frame = None
+        # Other league games' last seen scores, keyed by team, and when the list was last up
+        self._league_scores = {}
+        self._league_changed = set()  # changes not yet shown
+        self._league_shown_at = t.time()
+        # Week in which a game was seen unfinished; cleared once its end is celebrated
+        self._games_live_week = None
+        self._week_checked_at = 0
 
     @staticmethod
     def _display_name(matchup, side):
         # Team name first; the owner only when the platform gave no team name
         return (matchup.get(side + '_team') or matchup.get(side + '_name') or '').strip()
 
-    def _place_text(self, text, font, x, y, width, align='left'):
-        """Draw text in a box of the given width, or queue it to scroll if it won't fit."""
+    @staticmethod
+    def _abbreviate(name):
+        # "Bill's Mafia" -> "BM", "FracturedButWhole" -> "FBW"
+        caps = ''.join(c for c in name if c.isupper())
+        if len(caps) >= 2:
+            return caps
+        words = name.replace('-', ' ').replace('_', ' ').split()
+        if len(words) >= 2:
+            return ''.join(w[0] for w in words).upper()
+        return name[:3].upper()
+
+    def _place_text(self, text, font, x, y, width, align='left', centre_x=None):
+        """Draw text in a box of the given width, or queue it to scroll if it won't fit.
+
+        A scrolling name pauses on its abbreviation after each pass, centred on
+        `centre_x` (default: the middle of the box).
+        """
         text_w = font.getbbox(text)[2] if text else 0
         if text_w <= width:
             dx = width - text_w if align == 'right' else 0
             self.draw.text((x + dx, y), text, fill=(255, 255, 255), font=font)
             return
-        strip = Image.new('RGB', (text_w + SCROLL_GAP, font.getbbox(text)[3]))
+        height = font.getbbox(text)[3]
+        strip = Image.new('RGB', (text_w + SCROLL_GAP, height))
         ImageDraw.Draw(strip).text((0, 0), text, fill=(255, 255, 255), font=font)
-        self._scrollers.append((strip, x, y, width))
+        abbr = self._abbreviate(text)
+        while len(abbr) > 1 and font.getbbox(abbr)[2] > width:
+            abbr = abbr[:-1]
+        abbr_w = font.getbbox(abbr)[2]
+        centre = (centre_x - x) if centre_x is not None else width // 2
+        abbr_x = min(max(centre - abbr_w // 2, 0), width - abbr_w)
+        still = Image.new('RGB', (width, height))
+        ImageDraw.Draw(still).text((abbr_x, 0), abbr, fill=(255, 255, 255), font=font)
+        self._scrollers.append((strip, still, x, y, width))
+
+    def _note_league_changes(self, games):
+        """Remember which teams in the other league games have scored since the list was last up."""
+        for game in games:
+            for side in game:
+                last = self._league_scores.get(side['key'])
+                if last is not None and last != side['score']:
+                    self._league_changed.add(side['key'])
+                self._league_scores[side['key']] = side['score']
+
+    def _draw_league(self, games, seconds):
+        """List the other league games, one per row, paging if they don't fit."""
+        rows = 5
+        pages = [games[i:i + rows] for i in range(0, len(games), rows)] or [[]]
+        for page in pages:
+            self.image = Image.new('RGB', (self.width, self.height))
+            self.draw = ImageDraw.Draw(self.image)
+            for row, (left, right) in enumerate(page):
+                y = row * 6 + 1
+                for side, other, is_left in ((left, right, True), (right, left, False)):
+                    if side['key'] in self._league_changed:
+                        colour = (165, 200, 50)
+                    elif side['score'] < other['score']:
+                        colour = (110, 110, 110)  # trailing
+                    else:
+                        colour = (255, 255, 255)
+                    score = str(int(side['score']))
+                    score_w = self.font_mini.getbbox(score)[2]
+                    # Scores meet in the middle, names hug the edges
+                    score_x = 31 - score_w if is_left else 34
+                    room = score_x - 2 if is_left else self.width - (score_x + score_w + 2)
+                    abbr = self._abbreviate(side['name'])
+                    while len(abbr) > 1 and self.font_mini.getbbox(abbr)[2] > room:
+                        abbr = abbr[:-1]
+                    abbr_x = 0 if is_left else self.width - self.font_mini.getbbox(abbr)[2]
+                    self.draw.text((score_x, y), score, fill=colour, font=self.font_mini)
+                    self.draw.text((abbr_x, y), abbr, fill=colour, font=self.font_mini)
+            self._frame = self.image
+            self._show(self._frame)
+            self._hold(seconds / len(pages))
+        self.image = Image.new('RGB', (self.width, self.height))
+        self.draw = ImageDraw.Draw(self.image)
+        self._league_changed = set()
+        self._league_shown_at = t.time()
+
+    def _check_week_over(self):
+        """Flash the screen once when the week's last NFL game goes final."""
+        if t.time() - self._week_checked_at < WEEK_CHECK_EVERY:
+            return
+        self._week_checked_at = t.time()
+        finished = self.data.week_finished()
+        if finished is None:
+            return
+        if not finished:
+            self._games_live_week = self.data.week
+        elif self._games_live_week == self.data.week:
+            # Only after seeing it unfinished, so a restart mid-week doesn't flash
+            self._games_live_week = None
+            debug.info('Last game of week {0} is over'.format(self.data.week))
+            self._flash(WEEK_OVER_FLASHES)
+
+    def _flash(self, times):
+        # Blink the current screen, with any scrolling names frozen on their initials
+        frame = self._frame.copy()
+        for strip, still, x, y, width in self._scrollers:
+            frame.paste(still, (x, y), still.convert('L'))
+        blank = Image.new('RGB', (self.width, self.height))
+        for _ in range(times):
+            self._show(blank)
+            t.sleep(0.25)
+            self._show(frame)
+            t.sleep(0.4)
 
     def _show(self, image):
         self.canvas.SetImage(image, 0, 0)
@@ -65,14 +180,22 @@ class MainRenderer:
             self._scrollers = []
             t.sleep(seconds)
             return
+        # All names share one cycle sized to the longest: a shorter name starts
+        # its pass later so every pass ends together, then all hold on initials
+        longest = max(strip.width for strip, *_ in self._scrollers)
+        cycle = longest + int(SCROLL_PAUSE / SCROLL_STEP)
         end = t.time() + seconds
         while t.time() < end:
             frame = self._frame.copy()
-            for strip, x, y, width in self._scrollers:
-                offset = self._scroll_tick % strip.width
-                window = Image.new('RGB', (width, strip.height))
-                window.paste(strip, (-offset, 0))
-                window.paste(strip, (strip.width - offset, 0))
+            phase = self._scroll_tick % cycle
+            for strip, still, x, y, width in self._scrollers:
+                offset = phase - (longest - strip.width)
+                if not 0 <= offset < strip.width:
+                    window = still
+                else:
+                    window = Image.new('RGB', (width, strip.height))
+                    window.paste(strip, (-offset, 0))
+                    window.paste(strip, (strip.width - offset, 0))
                 # Mask on lit pixels so the window never blanks what's underneath
                 frame.paste(window, (x, y), window.convert('L'))
             self._show(frame)
@@ -210,8 +333,9 @@ class MainRenderer:
             opp_name = self._display_name(matchup, 'opp')
             user_name = self._display_name(matchup, 'user')
             debug.log("[pregame] display user='%s' opp='%s'" % (user_name, opp_name))
-            self._place_text(opp_name, self.font_mini, 0, 1, 30)
-            self._place_text(user_name, self.font_mini, 34, 1, 30, align='right')
+            # Paused initials centre over the logos (19px wide at x=0 and x=45)
+            self._place_text(opp_name, self.font_mini, 0, 1, 30, centre_x=9)
+            self._place_text(user_name, self.font_mini, 34, 1, 30, align='right', centre_x=54)
             if self.data.platform == "yahoo":
                 # Open the logo image file
                 opp_logo = Image.open(
@@ -277,20 +401,23 @@ class MainRenderer:
                 user_colour = (255, 255, 255)
                 matchup = self.data.matchup
                 game_date = 'WEEK {}'.format(self.data.week)
-                # --- Team names (live view) ---
-                # Both share the gap between the logos (x=20..44) on the top row
+                # --- Other league games: flash up on a change, otherwise every LEAGUE_EVERY ---
+                games = matchup.get('league') or []
+                self._note_league_changes(games)
+                mine_changed = (matchup['user_score'] != user_score
+                                or matchup['opp_score'] != opp_score)
+                # A change in our own game always gets the screen first
+                if games and not mine_changed:
+                    if self._league_changed:
+                        self._draw_league(games, LEAGUE_FLASH)
+                    elif t.time() - self._league_shown_at >= LEAGUE_EVERY:
+                        self._draw_league(games, LEAGUE_SHOW)
+                # --- Team names (live view), each above its own logo ---
                 _opp_name = self._display_name(matchup, 'opp')
                 _user_name = self._display_name(matchup, 'user')
                 debug.log("[live] display user='%s' opp='%s'" % (_user_name, _opp_name))
-                name_x, name_y, name_w = 20, 1, 25
-                opp_w = self.font_mini.getbbox(_opp_name)[2] if _opp_name else 0
-                user_w = self.font_mini.getbbox(_user_name)[2] if _user_name else 0
-                if opp_w + user_w + 3 <= name_w:
-                    self._place_text(_opp_name, self.font_mini, name_x, name_y, name_w)
-                    self._place_text(_user_name, self.font_mini, name_x, name_y, name_w, align='right')
-                else:
-                    self._place_text('{0} VS {1}'.format(_opp_name, _user_name),
-                                     self.font_mini, name_x, name_y, name_w)
+                self._place_text(_opp_name, self.font_mini, 0, 0, 30, centre_x=9)
+                self._place_text(_user_name, self.font_mini, 34, 0, 30, align='right', centre_x=54)
                 # --- end team names ---
                 # small increase in score
                 if matchup['user_score'] > user_score:
@@ -310,80 +437,42 @@ class MainRenderer:
                     user_colour = (255, 215, 0)
                 if matchup['opp_score'] > opp_score + 5:
                     opp_colour = (255, 215, 0)
-                # Using big and small numbers
-                opp_big, opp_small = divmod(matchup['opp_score'], 1)
-                opp_big = int(opp_big)
-                opp_small = int(round(opp_small, 2) * 100)
-                if opp_small < 10:
-                    opp_small = '0' + str(opp_small)
-                    opp_small_score = '{}'.format(opp_small)
-                else:
-                    opp_small_score = '{0:02d}'.format(opp_small)
-                user_big, user_small = divmod(matchup['user_score'], 1)
-                user_big = int(user_big)
-                user_small = int(round(user_small, 2) * 100)
-                if user_small < 10:
-                    user_small = '0' + str(user_small)
-                    user_small_score = '{}'.format(user_small)
-                else:
-                    user_small_score = '{0:02d}'.format(user_small)
-                opp_diff = '{:0.2f}'.format(
-                    abs(opp_score - matchup['opp_score']))
-                user_diff = '{:0.2f}'.format(
-                    abs(user_score - matchup['user_score']))
-                opp_big_size = self.font.getbbox(str(opp_big))[2]
-                opp_small_size = self.font_mini.getbbox(str(opp_small))[2]
-                user_big_size = self.font.getbbox(str(user_big))[2]
-                user_small_size = self.font_mini.getbbox(str(user_small))[2]
-                user_diff_size = self.font_mini.getbbox(user_diff)[0]
-                opp_diff_size = self.font_mini.getbbox(opp_diff)[0]
-                # this is bad form I know but idc come at me I'll fix it eventually when I'm not tired and trying random chit
-                opp_big_score = '{}'.format(opp_big)
-                user_big_score = '{}'.format(user_big)
-                # trying to centre them to make it a bit more a e s t h e t i c (essentially adding padding)
-                # ((self.width / 2) - (opp_big_size + opp_small_size)) / 2 - 2
-                left_offset = int(math.floor(opp_big / 100))
-                # eventually may colour differently depending on score advantage
-                self.draw.multiline_text(
-                    (left_offset, 19), opp_big_score, fill=opp_colour, font=self.font, align="left")
-                self.draw.multiline_text((opp_big_size + left_offset, 19), opp_small_score,
-                                         fill=opp_colour, font=self.font_mini, align="left")
-                user_big_width = self.font.getbbox(str(user_big))[2]
-                user_small_width = self.font_mini.getbbox(str(user_small))[2]
-
-                self.draw.multiline_text(
-                    (self.width - user_small_width - user_big_width, 19),
-                    user_big_score, fill=user_colour, font=self.font, align="left"
-                )
-                self.draw.multiline_text(
-                    (self.width - user_small_width, 19),
-                    user_small_score, fill=user_colour, font=self.font_mini, align="left"
-                )
-                # diffs
+                # Layout: names rows 1-5, logos rows 6-24, scores rows 26-30;
+                # WEEK and score changes sit in the column between the logos (x=20..44)
+                # Whole points in bold, then '.xx' in the thinner font
+                opp_big, opp_small = '{:.2f}'.format(matchup['opp_score']).split('.')
+                user_big, user_small = '{:.2f}'.format(matchup['user_score']).split('.')
+                opp_small, user_small = '.' + opp_small, '.' + user_small
+                opp_big_w = self.font_score.getbbox(opp_big)[2]
+                opp_small_w = self.font_mini.getbbox(opp_small)[2]
+                user_big_w = self.font_score.getbbox(user_big)[2]
+                user_small_w = self.font_mini.getbbox(user_small)[2]
+                score_y = 25
+                self.draw.text((0, score_y), opp_big, fill=opp_colour, font=self.font_score)
+                self.draw.text((opp_big_w, score_y), opp_small, fill=opp_colour, font=self.font_mini)
+                user_small_x = self.width - user_small_w
+                user_big_x = user_small_x - user_big_w
+                self.draw.text((user_big_x, score_y), user_big, fill=user_colour, font=self.font_score)
+                self.draw.text((user_small_x, score_y), user_small, fill=user_colour, font=self.font_mini)
+                # Score changes: opponent's upper left, user's lower right of the middle column
                 if abs(opp_score - matchup['opp_score']) > 0:
-                    self.draw.multiline_text(
-                        (21, 6), opp_diff, fill=opp_colour, font=self.font_mini, align="left")
+                    opp_diff = '{:0.2f}'.format(abs(opp_score - matchup['opp_score']))
+                    self.draw.text((20, 12), opp_diff, fill=opp_colour, font=self.font_mini)
                 if abs(user_score - matchup['user_score']) > 0:
-                    self.draw.multiline_text((self.width - 20 - user_diff_size, 12),
-                                             user_diff, fill=user_colour, font=self.font_mini, align="right")
-                # Set the projections on the screen?
+                    user_diff = '{:0.2f}'.format(abs(user_score - matchup['user_score']))
+                    self.draw.text((45 - self.font_mini.getbbox(user_diff)[2], 18),
+                                   user_diff, fill=user_colour, font=self.font_mini)
                 _bbox = self.font_mini.getbbox(game_date)
                 _width = _bbox[2] - _bbox[0]
                 game_date_pos = center_text(_width, 32)
-                self.draw.text(
-                    (game_date_pos, 7),  # push baseline further down to guarantee top row visible
-                    game_date,
-                    fill=(255, 255, 255),
-                    font=self.font_mini,
-                    align="center"
-                )
-                # --- Projected points difference (user minus opponent), centered under week label ---
+                self.draw.text((game_date_pos, 6), game_date, fill=(255, 255, 255), font=self.font_mini)
+                # --- Projected points difference (user minus opponent), between the scores ---
                 try:
                     user_proj = float(matchup.get('user_proj', 0) or 0)
                     opp_proj = float(matchup.get('opp_proj', 0) or 0)
                     proj_diff = user_proj - opp_proj
                     prefix = '+' if proj_diff >= 0 else ''
-                    diff_text = f" {prefix}{proj_diff:.1f}"
+                    diff_text = f"{prefix}{proj_diff:.1f}"
 
                     # Color thresholds: green if > 5, orange if between 5 and 0 (inclusive), red if < 0
                     if proj_diff > 5:
@@ -395,15 +484,10 @@ class MainRenderer:
 
                     diff_bbox = self.font_mini.getbbox(diff_text)
                     diff_width = diff_bbox[2] - diff_bbox[0]
-                    diff_pos = center_text(diff_width, 32)
-
-                    self.draw.text(
-                        (diff_pos, 14),
-                        diff_text,
-                        fill=diff_color,
-                        font=self.font_mini,
-                        align="center"
-                    )
+                    diff_pos = int(center_text(diff_width, 32))
+                    # Skip it rather than overlap a wide score
+                    if diff_pos >= opp_big_w + opp_small_w + 2 and diff_pos + diff_width <= user_big_x - 2:
+                        self.draw.text((diff_pos, score_y), diff_text, fill=diff_color, font=self.font_mini)
                 except Exception:
                     # If parsing fails or keys are missing, silently skip rendering the diff
                     pass
@@ -425,10 +509,11 @@ class MainRenderer:
                     user_logo = Image.open(
                         'logos/{}.png'.format(user_av)).resize((19, 19), Image.BOX)
                 # Composite the logos into the frame so _hold() can redraw it
-                self.image.paste(opp_logo.convert("RGB"), (0, 0))
-                self.image.paste(user_logo.convert("RGB"), (45, 0))
+                self.image.paste(opp_logo.convert("RGB"), (0, 6))
+                self.image.paste(user_logo.convert("RGB"), (45, 6))
                 self._frame = self.image
                 self._show(self._frame)
+                self._check_week_over()
                 # Refresh the Data image.
                 self.image = Image.new('RGB', (self.width, self.height))
                 self.draw = ImageDraw.Draw(self.image)

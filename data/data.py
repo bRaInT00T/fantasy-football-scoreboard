@@ -92,6 +92,15 @@ class Data:
         delta = (kickoff - datetime.now(timezone.utc)).total_seconds()
         return (max(0, delta), kickoff)
 
+    def week_finished(self):
+        # True once every NFL game this week is final, None if ESPN can't be reached
+        try:
+            events = self._scoreboard_events()
+        except Exception as error:
+            debug.warning('could not check for end of week: {0}'.format(error))
+            return None
+        return bool(events) and all(self._event_state(e) == 'post' for e in events)
+
     def get_current_date(self):
         # pretty dumb function but whatever
         return datetime.now(timezone.utc)

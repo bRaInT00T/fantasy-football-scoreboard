@@ -204,7 +204,8 @@ class YahooFantasyInfo():
 
     def get_matchup(self, game_id, league_id, team_id, week):
         self.refresh_access_token()
-        url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{self.game_id}.l.{self.league_id}.t.{self.team_id}/matchups;weeks={week}"
+        # The league scoreboard has every matchup, so one call covers ours and the rest
+        url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{self.game_id}.l.{self.league_id}/scoreboard;week={week}"
         response = self.oauth.session.get(url, params={'format': 'json'})
         try:
             data = response.json()
@@ -214,8 +215,31 @@ class YahooFantasyInfo():
         if "fantasy_content" not in data:
             raise YahooAPIError(_describe_error(response, data))
 
-        matchup = data["fantasy_content"]["team"][1]["matchups"]
-        matchup_info = {}
+        all_matchups = data["fantasy_content"]["league"][1]["scoreboard"]["0"]["matchups"]
+        matchup = {}
+        league = []
+        for m in all_matchups:
+            if isinstance(all_matchups[m], int):  # skip "count"
+                continue
+            teams = all_matchups[m]['matchup']['0']['teams']
+            sides = []
+            for t in ('0', '1'):
+                info = {}
+                for item in teams[t]['team'][0]:
+                    if isinstance(item, dict):
+                        info.update(item)
+                sides.append({
+                    'key': info.get('team_key'),
+                    'name': info.get('name', 'Unknown'),
+                    'score': float(teams[t]['team'][1].get('team_points', {}).get('total', 0) or 0),
+                    'mine': info.get('is_owned_by_current_login') == 1
+                            or str(info.get('team_id')) == str(self.team_id),
+                })
+            if any(side['mine'] for side in sides):
+                matchup[m] = all_matchups[m]
+            else:
+                league.append(sides)
+        matchup_info = {'league': league}
 
         for m in matchup:
             if not isinstance(matchup[m], int):  # skip "count"
