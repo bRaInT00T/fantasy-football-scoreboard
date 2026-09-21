@@ -22,6 +22,10 @@ LEAGUE_FLASH = 5
 # How often to ask ESPN whether the week's last game is over, and the flash then
 WEEK_CHECK_EVERY = 60
 WEEK_OVER_FLASHES = 5
+# Standby panel brightness (1-100, 1 is the dimmest), and minutes the scoreboard
+# stays up after the last game with one of our starters stops
+STANDBY_BRIGHTNESS = 1
+LINGER_MINUTES = 10
 
 
 class MainRenderer:
@@ -36,6 +40,9 @@ class MainRenderer:
         # use this to check if week has changed
         self.week = data.week
         self._in_standby = False
+        self._brightness = matrix.brightness
+        self._idle_since = None
+        self._idle_checked_at = 0
         # Create a new data image.
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
@@ -158,6 +165,20 @@ class MainRenderer:
             debug.info('Last game of week {0} is over'.format(self.data.week))
             self._flash(WEEK_OVER_FLASHES)
 
+    def _games_over(self):
+        """True once no game with one of our starters has been on for LINGER_MINUTES."""
+        if not self.data.config.sleep_enabled or t.time() - self._idle_checked_at < WEEK_CHECK_EVERY:
+            return False
+        self._idle_checked_at = t.time()
+        upcoming = self.data.next_kickoff()
+        # On now, schedule unknown, or due soon enough that standby wouldn't take over
+        if upcoming is None or upcoming[0] < self.data.config.wake_before_hours * 3600:
+            self._idle_since = None
+            return False
+        if self._idle_since is None:
+            self._idle_since = t.time()
+        return t.time() - self._idle_since >= LINGER_MINUTES * 60
+
     def _flash(self, times):
         # Blink the current screen, with any scrolling names frozen on their initials
         frame = self._frame.copy()
@@ -223,34 +244,35 @@ class MainRenderer:
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
         pos = center_text(self.font_mini.getbbox(label)[2], 32)
+        # Full white: the panel brightness does the dimming, and grey at 1% vanishes
         self.draw.multiline_text((pos, 12), label, fill=(
-            110, 110, 110), font=self.font_mini, align="center")
+            255, 255, 255), font=self.font_mini, align="center")
         self.canvas.SetImage(self.image, 0, 0)
         self.canvas = self.matrix.SwapOnVSync(self.canvas)
 
+    def _wake(self):
+        if self._in_standby:
+            self.matrix.brightness = self._brightness
+        self._in_standby = False
+        return False
+
     def _standby(self):
+        # Dim and wait whenever no game with one of our matchup's starters is on
+        # or due within wake_before_hours
         config = self.data.config
         if not config.sleep_enabled:
-            self._in_standby = False
-            return False
+            return self._wake()
         upcoming = self.data.next_kickoff()
         # Unknown schedule: stay awake rather than risk sleeping through a game
         if upcoming is None:
-            self._in_standby = False
-            return False
+            return self._wake()
         seconds, kickoff = upcoming
-        # Takes a long gap to drop into standby, but once there it stays until
-        # just before kickoff - otherwise it would wake a full sleep_after
-        # ahead of the game and wake_before_hours would never apply
-        threshold = (config.wake_before_hours if self._in_standby
-                     else config.sleep_after_hours)
-        if seconds < threshold * 3600:
-            self._in_standby = False
-            return False
         nap = min(seconds - config.wake_before_hours * 3600, STANDBY_MAX_NAP)
         if nap <= 0:
-            self._in_standby = False
-            return False
+            return self._wake()
+        if not self._in_standby:
+            # Brightness applies as pixels are drawn, so set it before drawing
+            self.matrix.brightness = STANDBY_BRIGHTNESS
         self._in_standby = True
         debug.info('Standby, next kickoff in {0:.1f}h, sleeping {1:.1f}h'.format(
             seconds / 3600, nap / 3600))
@@ -514,6 +536,14 @@ class MainRenderer:
                 self._frame = self.image
                 self._show(self._frame)
                 self._check_week_over()
+                if self._games_over():
+                    # Hand back to __render_game, which dims into standby
+                    debug.info('No game with our starters on, leaving live view')
+                    self._idle_since = None
+                    self._scrollers = []
+                    self.image = Image.new('RGB', (self.width, self.height))
+                    self.draw = ImageDraw.Draw(self.image)
+                    return
                 # Refresh the Data image.
                 self.image = Image.new('RGB', (self.width, self.height))
                 self.draw = ImageDraw.Draw(self.image)

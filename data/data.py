@@ -61,6 +61,25 @@ class Data:
         url = API_URL if week is None else '{0}?week={1}'.format(API_URL, week)
         return requests.get(url).json().get('events', [])
 
+    def _relevant_teams(self):
+        # NFL teams our matchup has starters on, or None to count every game
+        # (other platforms, or a failed lookup - better awake than asleep)
+        lookup = getattr(self.api, 'starting_nfl_teams', None)
+        if lookup is None:
+            return None
+        try:
+            return lookup()
+        except Exception as error:
+            debug.warning('could not look up starters: {0}'.format(error))
+            return None
+
+    @staticmethod
+    def _involving(events, teams):
+        if teams is None:
+            return events
+        return [e for e in events
+                if {c['team']['abbreviation'] for c in e['competitions'][0]['competitors']} & teams]
+
     @staticmethod
     def _event_state(event):
         return event['status']['type']['state']
@@ -74,9 +93,9 @@ class Data:
     def next_kickoff(self):
         # (0, None) while a game is in progress. None means the schedule is
         # unknown, and the caller should stay awake rather than risk sleeping
-        # through a game.
+        # through a game. Only games with one of our matchup's starters count.
         try:
-            events = self._scoreboard_events()
+            events = self._involving(self._scoreboard_events(), self._relevant_teams())
             if any(self._event_state(e) == 'in' for e in events):
                 return (0, None)
             kickoff = self._earliest_kickoff(events)
@@ -93,9 +112,10 @@ class Data:
         return (max(0, delta), kickoff)
 
     def week_finished(self):
-        # True once every NFL game this week is final, None if ESPN can't be reached
+        # True once every game with one of our matchup's starters is final this
+        # week, None if ESPN can't be reached
         try:
-            events = self._scoreboard_events()
+            events = self._involving(self._scoreboard_events(), self._relevant_teams())
         except Exception as error:
             debug.warning('could not check for end of week: {0}'.format(error))
             return None

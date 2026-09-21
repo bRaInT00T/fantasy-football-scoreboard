@@ -3,7 +3,14 @@ from datetime import datetime
 import os
 import debug
 import json
+import time
 from yahoo_oauth import OAuth2
+
+# Lineup slots that don't score, and Yahoo team codes that differ from ESPN's
+NON_STARTING_SLOTS = {'BN', 'IR', 'IR+', 'NA'}
+YAHOO_TO_ESPN_TEAM = {'WAS': 'WSH'}
+# Seconds to reuse the starters lookup; lineups rarely change mid-window
+STARTERS_TTL = 900
 
 
 class YahooAPIError(Exception):
@@ -22,6 +29,9 @@ class YahooFantasyInfo():
         self.league_id = league_id
         self.game_id = game_id
         self.week = week
+        self.matchup_team_keys = []
+        self._starters = None
+        self._starters_at = 0
         self.auth_info = {"consumer_key": yahoo_consumer_key,
                           "consumer_secret": yahoo_consumer_secret}
         
@@ -237,6 +247,7 @@ class YahooFantasyInfo():
                 })
             if any(side['mine'] for side in sides):
                 matchup[m] = all_matchups[m]
+                self.matchup_team_keys = [side['key'] for side in sides]
             else:
                 league.append(sides)
         matchup_info = {'league': league}
@@ -306,6 +317,38 @@ class YahooFantasyInfo():
                             matchup_info['opp_score'] = float(actual_points)
 
         return matchup_info
+
+    def starting_nfl_teams(self):
+        """NFL teams (ESPN codes) with a starter from either side of our matchup."""
+        if self._starters is not None and time.time() - self._starters_at < STARTERS_TTL:
+            return self._starters
+        teams = set()
+        for key in self.matchup_team_keys:
+            self.refresh_access_token()
+            url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{key}/roster;week={self.week}"
+            response = self.oauth.session.get(url, params={'format': 'json'})
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if "fantasy_content" not in data:
+                raise YahooAPIError(_describe_error(response, data))
+            players = data["fantasy_content"]["team"][1]["roster"]["0"]["players"]
+            for p in players:
+                if isinstance(players[p], int):  # skip "count"
+                    continue
+                info = {}
+                for item in players[p]['player'][0]:
+                    if isinstance(item, dict):
+                        info.update(item)
+                slot = next((item['position'] for item in players[p]['player'][1]['selected_position']
+                             if isinstance(item, dict) and 'position' in item), 'BN')
+                if slot in NON_STARTING_SLOTS:
+                    continue
+                team = (info.get('editorial_team_abbr') or '').upper()
+                teams.add(YAHOO_TO_ESPN_TEAM.get(team, team))
+        self._starters, self._starters_at = teams, time.time()
+        return teams
 
     def get_avatars(self, teams):
         self.refresh_access_token()
