@@ -51,6 +51,10 @@ class MainRenderer:
         self._brightness = matrix.brightness
         self._idle_since = None
         self._idle_checked_at = 0
+        # Whether a game with one of our matchup's starters is on, and the next kickoff if not
+        self._live_checked_at = 0
+        self._starters_on = True
+        self._next_kickoff = None
         # Create a new data image.
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
@@ -287,6 +291,16 @@ class MainRenderer:
             self._idle_since = t.time()
         return t.time() - self._idle_since >= LINGER_MINUTES * 60
 
+    def _matchup_live(self):
+        """False while no game with a starter from either side of our matchup is on."""
+        if t.time() - self._live_checked_at >= WEEK_CHECK_EVERY:
+            self._live_checked_at = t.time()
+            upcoming = self.data.next_kickoff()
+            # Unknown schedule: show the matchup rather than hide it by mistake
+            self._starters_on = upcoming is None or upcoming[0] == 0
+            self._next_kickoff = None if upcoming is None else upcoming[1]
+        return self._starters_on
+
     def _flash(self, times):
         # Blink the current screen, with any scrolling names frozen on their initials
         frame = self._frame.copy()
@@ -352,16 +366,17 @@ class MainRenderer:
             local.minute,
             'AM' if local.hour < 12 else 'PM')
 
-    def _draw_standby(self, kickoff):
+    def _paint_next_kickoff(self, kickoff):
         label = 'NEXT: ' + self._kickoff_label(kickoff)
-        self.image = Image.new('RGB', (self.width, self.height))
-        self.draw = ImageDraw.Draw(self.image)
+        self._new_screen()
         pos = center_text(self.font_mini.getbbox(label)[2], 32)
         # Full white: the panel brightness does the dimming, and grey at 1% vanishes
         self.draw.multiline_text((pos, 12), label, fill=(
             255, 255, 255), font=self.font_mini, align="center")
-        self.canvas.SetImage(self.image, 0, 0)
-        self.canvas = self.matrix.SwapOnVSync(self.canvas)
+
+    def _draw_standby(self, kickoff):
+        self._paint_next_kickoff(kickoff)
+        self._show(self.image)
 
     def _wake(self):
         if self._in_standby:
@@ -657,6 +672,11 @@ class MainRenderer:
                 # Composite the logos into the frame so _hold() can redraw it
                 self.image.paste(opp_logo.convert("RGB"), (0, 6))
                 self.image.paste(user_logo.convert("RGB"), (45, 6))
+                if not self._matchup_live():
+                    # Neither side has anyone on yet (or any more): keep to the
+                    # other screens, and between them say when our next game is
+                    self._scrollers = []
+                    self._paint_next_kickoff(self._next_kickoff)
                 self._frame = self.image
                 self._show(self._frame)
                 self._check_week_over()
