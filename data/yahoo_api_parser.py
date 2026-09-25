@@ -3,7 +3,14 @@ from datetime import datetime
 import os
 import debug
 import json
+import time
 from yahoo_oauth import OAuth2
+
+# Lineup slots that don't score, and Yahoo team codes that differ from ESPN's
+NON_STARTING_SLOTS = {'BN', 'IR', 'IR+', 'NA'}
+YAHOO_TO_ESPN_TEAM = {'WAS': 'WSH'}
+# Seconds to reuse the starters lookup; lineups rarely change mid-window
+STARTERS_TTL = 900
 
 
 class YahooAPIError(Exception):
@@ -22,6 +29,10 @@ class YahooFantasyInfo():
         self.league_id = league_id
         self.game_id = game_id
         self.week = week
+        self.matchup_team_keys = []
+        self.user_team_key = None
+        self._starters = None
+        self._starters_at = 0
         self.auth_info = {"consumer_key": yahoo_consumer_key,
                           "consumer_secret": yahoo_consumer_secret}
         
@@ -204,7 +215,8 @@ class YahooFantasyInfo():
 
     def get_matchup(self, game_id, league_id, team_id, week):
         self.refresh_access_token()
-        url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{self.game_id}.l.{self.league_id}.t.{self.team_id}/matchups;weeks={week}"
+        # The league scoreboard has every matchup, so one call covers ours and the rest
+        url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{self.game_id}.l.{self.league_id}/scoreboard;week={week}"
         response = self.oauth.session.get(url, params={'format': 'json'})
         try:
             data = response.json()
@@ -214,8 +226,33 @@ class YahooFantasyInfo():
         if "fantasy_content" not in data:
             raise YahooAPIError(_describe_error(response, data))
 
-        matchup = data["fantasy_content"]["team"][1]["matchups"]
-        matchup_info = {}
+        all_matchups = data["fantasy_content"]["league"][1]["scoreboard"]["0"]["matchups"]
+        matchup = {}
+        league = []
+        for m in all_matchups:
+            if isinstance(all_matchups[m], int):  # skip "count"
+                continue
+            teams = all_matchups[m]['matchup']['0']['teams']
+            sides = []
+            for t in ('0', '1'):
+                info = {}
+                for item in teams[t]['team'][0]:
+                    if isinstance(item, dict):
+                        info.update(item)
+                sides.append({
+                    'key': info.get('team_key'),
+                    'name': info.get('name', 'Unknown'),
+                    'score': float(teams[t]['team'][1].get('team_points', {}).get('total', 0) or 0),
+                    'mine': info.get('is_owned_by_current_login') == 1
+                            or str(info.get('team_id')) == str(self.team_id),
+                })
+            if any(side['mine'] for side in sides):
+                matchup[m] = all_matchups[m]
+                self.matchup_team_keys = [side['key'] for side in sides]
+                self.user_team_key = next(side['key'] for side in sides if side['mine'])
+            else:
+                league.append(sides)
+        matchup_info = {'league': league}
 
         for m in matchup:
             if not isinstance(matchup[m], int):  # skip "count"
@@ -282,6 +319,46 @@ class YahooFantasyInfo():
                             matchup_info['opp_score'] = float(actual_points)
 
         return matchup_info
+
+    def starting_nfl_teams(self):
+        """NFL teams (ESPN codes) with a starter from either side of our matchup."""
+        counts = self.starter_counts()
+        return set(counts['user']) | set(counts['opp'])
+
+    def starter_counts(self):
+        """Starters per NFL team (ESPN codes) for each side of our matchup,
+        as {'user': {'GB': 2, ...}, 'opp': {...}}."""
+        if self._starters is not None and time.time() - self._starters_at < STARTERS_TTL:
+            return self._starters
+        counts = {'user': {}, 'opp': {}}
+        for key in self.matchup_team_keys:
+            side = counts['user' if key == self.user_team_key else 'opp']
+            self.refresh_access_token()
+            url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{key}/roster;week={self.week}"
+            response = self.oauth.session.get(url, params={'format': 'json'})
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if "fantasy_content" not in data:
+                raise YahooAPIError(_describe_error(response, data))
+            players = data["fantasy_content"]["team"][1]["roster"]["0"]["players"]
+            for p in players:
+                if isinstance(players[p], int):  # skip "count"
+                    continue
+                info = {}
+                for item in players[p]['player'][0]:
+                    if isinstance(item, dict):
+                        info.update(item)
+                slot = next((item['position'] for item in players[p]['player'][1]['selected_position']
+                             if isinstance(item, dict) and 'position' in item), 'BN')
+                if slot in NON_STARTING_SLOTS:
+                    continue
+                team = (info.get('editorial_team_abbr') or '').upper()
+                team = YAHOO_TO_ESPN_TEAM.get(team, team)
+                side[team] = side.get(team, 0) + 1
+        self._starters, self._starters_at = counts, time.time()
+        return counts
 
     def get_avatars(self, teams):
         self.refresh_access_token()
