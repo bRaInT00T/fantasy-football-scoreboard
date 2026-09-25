@@ -136,16 +136,7 @@ class Data:
         competition = slot[0]['competitions'][0]
         teams = {c['homeAway']: c['team']['abbreviation'] for c in competition['competitors']}
         odds = (competition.get('odds') or [{}])[0]
-        # Our matchup's starters in it, per side (Yahoo only; None elsewhere)
-        starters = {'user': None, 'opp': None}
-        lookup = getattr(self.api, 'starter_counts', None)
-        if lookup is not None:
-            try:
-                counts = lookup()
-                for side in starters:
-                    starters[side] = sum(counts[side].get(team, 0) for team in teams.values())
-            except Exception as error:
-                debug.warning('could not look up starters: {0}'.format(error))
+        starters = self._starters_in(teams.values())
         return {
             'league': 'nfl',
             'away': teams.get('away', '?'),
@@ -157,6 +148,48 @@ class Data:
             'user_starters': starters['user'],
             'opp_starters': starters['opp'],
         }
+
+    def _starters_in(self, nfl_teams):
+        # How many of each side's starters play for these NFL teams, as
+        # {'user': n, 'opp': n}; None each when unknown (Yahoo only)
+        starters = {'user': None, 'opp': None}
+        lookup = getattr(self.api, 'starter_counts', None)
+        if lookup is not None:
+            try:
+                counts = lookup()
+                for side in starters:
+                    starters[side] = sum(counts[side].get(team, 0) for team in nfl_teams)
+            except Exception as error:
+                debug.warning('could not look up starters: {0}'.format(error))
+        return starters
+
+    def live_games(self):
+        # NFL games in progress with a starter from either side of our matchup
+        try:
+            events = self._involving(self._scoreboard_events(), self._relevant_teams())
+        except Exception as error:
+            debug.warning('could not look up live games: {0}'.format(error))
+            return []
+        games = []
+        for event in events:
+            if self._event_state(event) != 'in':
+                continue
+            competition = event['competitions'][0]
+            sides = {c['homeAway']: c for c in competition['competitors']}
+            has_ball = (competition.get('situation') or {}).get('possession')
+            starters = self._starters_in([c['team']['abbreviation'] for c in sides.values()])
+            games.append({
+                'league': 'nfl',
+                'away': sides['away']['team']['abbreviation'],
+                'home': sides['home']['team']['abbreviation'],
+                'away_score': int(sides['away'].get('score') or 0),
+                'home_score': int(sides['home'].get('score') or 0),
+                'clock': event['status']['type']['shortDetail'],  # e.g. "15:00 - 2nd", "Halftime"
+                'possession': next((side for side, c in sides.items() if c['team']['id'] == has_ball), None),
+                'user_starters': starters['user'],
+                'opp_starters': starters['opp'],
+            })
+        return games
 
     def mlb_game(self, team):
         # `team`'s MLB game while it's in progress, None otherwise or if ESPN

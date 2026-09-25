@@ -23,6 +23,11 @@ LEAGUE_FLASH = 5
 # looks at it and how long it stays up
 NEXT_GAME_EVERY = 60
 NEXT_GAME_SHOW = 6
+# Live NFL games with our starters: seconds between looks and each game's time up
+LIVE_GAMES_EVERY = 40
+LIVE_GAME_SHOW = 5
+# While another screen is up, seconds between checks on our fantasy score
+SCORE_CHECK_EVERY = 4
 # An MLB team to show while it's playing: seconds between looks and how long it stays up
 MLB_TEAM = 'PHI'
 MLB_EVERY = 45
@@ -75,6 +80,9 @@ class MainRenderer:
         self._league_shown_at = t.time()
         self._next_game_shown_at = t.time()
         self._mlb_shown_at = t.time()
+        self._live_games_shown_at = t.time()
+        # Our matchup's scores as last put on screen, to spot a change behind other screens
+        self._shown_scores = None
         self._team_logos = {}  # (league, abbr) -> logo image, or None if there isn't one
         # Week in which a game was seen unfinished; cleared once its end is celebrated
         self._games_live_week = None
@@ -158,11 +166,14 @@ class MainRenderer:
                     self.draw.text((abbr_x, y), abbr, fill=colour, font=self.font_mini)
             self._frame = self.image
             self._show(self._frame)
-            self._hold(seconds / len(pages))
+            interrupted = self._hold_away(seconds / len(pages))
+            if interrupted:
+                break
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
         self._league_changed = set()
         self._league_shown_at = t.time()
+        return interrupted
 
     def _team_logo(self, league, abbr):
         """An ESPN team logo on black at logo size, or None if there isn't one."""
@@ -225,10 +236,55 @@ class MainRenderer:
                 if self.font_mini.getbbox(spread)[2] + 3 + text_w <= self.width:
                     self.draw.text((self.width - text_w, 25), text, fill=grey, font=self.font_mini)
                     break
+        return self._put_up(seconds)
+
+    def _put_up(self, seconds):
+        """Show the screen just drawn for `seconds`, or less if our fantasy score moves."""
         self._frame = self.image
         self._show(self._frame)
-        self._hold(seconds)
+        interrupted = self._hold_away(seconds)
         self._new_screen()
+        return interrupted
+
+    def _draw_logo_scores(self, away_score, home_score):
+        # Scores under their logos; the trailing side greyed like the league list
+        for score, other, x in ((away_score, home_score, 0),
+                                (home_score, away_score, self.width - self.avsize)):
+            text = str(score)
+            colour = (110, 110, 110) if score < other else (255, 255, 255)
+            text_w = self.font_score.getbbox(text)[2]
+            self.draw.text((x + (self.avsize - text_w) // 2, 25), text, fill=colour, font=self.font_score)
+
+    @staticmethod
+    def _game_clock(detail):
+        # ESPN's "15:00 - 2nd" -> "Q2 15:00", "End of 1st" -> "END Q1", "Halftime" -> "HALF"
+        quarters = {'1st': 'Q1', '2nd': 'Q2', '3rd': 'Q3', '4th': 'Q4'}
+        if ' - ' in detail:
+            clock, period = detail.split(' - ', 1)
+            return '{0} {1}'.format(quarters.get(period, period.upper()), clock)
+        if detail.startswith('End of '):
+            period = detail[len('End of '):]
+            return 'END ' + quarters.get(period, period.upper())
+        return 'HALF' if detail == 'Halftime' else detail.upper()
+
+    def _draw_live_games(self, games, seconds):
+        """Show each live NFL game with our starters: clock, logos, score, who has the ball."""
+        for game in games:
+            self._new_screen()
+            self._centre(self._game_clock(game['clock']), 0, (255, 255, 255))
+            self._draw_team_logos('nfl', game['away'], game['home'], 6)
+            if game['user_starters'] or game['opp_starters']:
+                self._centre('ME {0}'.format(game['user_starters']), 10, (165, 200, 50))
+                self._centre('OPP {0}'.format(game['opp_starters']), 17, (255, 44, 44))
+            self._draw_logo_scores(game['away_score'], game['home_score'])
+            # A dot beside the score of the side with the ball
+            if game['possession'] == 'away':
+                self.draw.rectangle((21, 27, 22, 28), fill=(255, 165, 0))
+            elif game['possession'] == 'home':
+                self.draw.rectangle((41, 27, 42, 28), fill=(255, 165, 0))
+            if self._put_up(seconds):
+                return True
+        return False
 
     def _draw_mlb_game(self, game, seconds):
         """Show a live MLB game: inning, logos, runners on base, outs and the score."""
@@ -249,17 +305,8 @@ class MainRenderer:
                 x = 26 + i * 5
                 self.draw.rectangle((x, 20, x + 1, 21),
                                     fill=(255, 44, 44) if i < game['outs'] else unlit)
-        # Scores under their logos; the trailing side greyed like the league list
-        for score, other, x in ((game['away_score'], game['home_score'], 0),
-                                (game['home_score'], game['away_score'], self.width - self.avsize)):
-            text = str(score)
-            colour = (110, 110, 110) if score < other else (255, 255, 255)
-            text_w = self.font_score.getbbox(text)[2]
-            self.draw.text((x + (self.avsize - text_w) // 2, 25), text, fill=colour, font=self.font_score)
-        self._frame = self.image
-        self._show(self._frame)
-        self._hold(seconds)
-        self._new_screen()
+        self._draw_logo_scores(game['away_score'], game['home_score'])
+        return self._put_up(seconds)
 
     def _check_week_over(self):
         """Flash the screen once when the week's last NFL game goes final."""
@@ -316,6 +363,28 @@ class MainRenderer:
     def _show(self, image):
         self.canvas.SetImage(image, 0, 0)
         self.canvas = self.matrix.SwapOnVSync(self.canvas)
+
+    def _fantasy_changed(self):
+        """Re-read our fantasy scores; True if either moved since our matchup was last up."""
+        if self._shown_scores is None or not self.data.check_scores:
+            return False
+        try:
+            self.data.refresh_scores()
+        except Exception as error:
+            debug.warning('could not refresh scores: {0}'.format(error))
+            return False
+        matchup = self.data.matchup
+        return bool(matchup) and (matchup['user_score'], matchup['opp_score']) != self._shown_scores
+
+    def _hold_away(self, seconds):
+        """Hold a screen other than our matchup, cutting it short (True) if our score moves."""
+        end = t.time() + seconds
+        while t.time() < end:
+            t.sleep(max(0, min(SCORE_CHECK_EVERY, end - t.time())))
+            if t.time() < end and self._fantasy_changed():
+                debug.info('Fantasy score changed, back to our matchup')
+                return True
+        return False
 
     def _hold(self, seconds):
         """Keep the last frame up for `seconds`, scrolling any names that didn't fit."""
@@ -558,21 +627,32 @@ class MainRenderer:
                                 or matchup['opp_score'] != opp_score)
                 # A change in our own game always gets the screen first, and
                 # at most one of these shows between looks at our matchup
+                interrupted = False
                 if not mine_changed:
                     if games and self._league_changed:
-                        self._draw_league(games, LEAGUE_FLASH)
+                        interrupted = self._draw_league(games, LEAGUE_FLASH)
                     elif games and t.time() - self._league_shown_at >= LEAGUE_EVERY:
-                        self._draw_league(games, LEAGUE_SHOW)
+                        interrupted = self._draw_league(games, LEAGUE_SHOW)
+                    elif t.time() - self._live_games_shown_at >= LIVE_GAMES_EVERY:
+                        self._live_games_shown_at = t.time()
+                        live_games = self.data.live_games()
+                        if live_games:
+                            interrupted = self._draw_live_games(live_games, LIVE_GAME_SHOW)
                     elif t.time() - self._mlb_shown_at >= MLB_EVERY:
                         self._mlb_shown_at = t.time()
                         mlb_game = self.data.mlb_game(MLB_TEAM)
                         if mlb_game:
-                            self._draw_mlb_game(mlb_game, MLB_SHOW)
+                            interrupted = self._draw_mlb_game(mlb_game, MLB_SHOW)
                     elif t.time() - self._next_game_shown_at >= NEXT_GAME_EVERY:
                         self._next_game_shown_at = t.time()
                         next_game = self.data.next_solo_game()
                         if next_game:
-                            self._draw_next_game(next_game, NEXT_GAME_SHOW)
+                            interrupted = self._draw_next_game(next_game, NEXT_GAME_SHOW)
+                if interrupted:
+                    # Our score moved behind another screen: straight back to the
+                    # matchup, which shows the change
+                    self.data.needs_refresh = True
+                    continue
                 # --- Team names (live view), each above its own logo ---
                 _opp_name = self._display_name(matchup, 'opp')
                 _user_name = self._display_name(matchup, 'user')
@@ -694,6 +774,7 @@ class MainRenderer:
                 # Save the scores.
                 opp_score = matchup['opp_score']
                 user_score = matchup['user_score']
+                self._shown_scores = (user_score, opp_score)
                 self.data.needs_refresh = True
                 self._hold(10 + extra_sleep)
             else:
