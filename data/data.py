@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import math
+import os
 import data.sleeper_api_parser as sleeper
 import data.yahoo_api_parser as yahoo
 import data.espn_api_parser as espn
@@ -7,6 +8,10 @@ import debug
 import requests
 
 API_URL = 'http://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard'
+MLB_URL = 'http://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard'
+# ESPN team logos, the dark-background version first; cached under logos/
+LOGO_URLS = ('https://a.espncdn.com/i/teamlogos/{0}/500-dark/{1}.png',
+             'https://a.espncdn.com/i/teamlogos/{0}/500/{1}.png')
 
 
 class Data:
@@ -110,6 +115,94 @@ class Data:
             return None
         delta = (kickoff - datetime.now(timezone.utc)).total_seconds()
         return (max(0, delta), kickoff)
+
+    def next_solo_game(self):
+        # The next NFL game to kick off, if it has its slot to itself (Thursday
+        # or Monday night, an early international game), with its betting line.
+        # None when the next slot has several games or ESPN can't be reached.
+        try:
+            events = [e for e in self._scoreboard_events() if self._event_state(e) == 'pre']
+            if not events:
+                events = [e for e in self._scoreboard_events(self.week + 1)
+                          if self._event_state(e) == 'pre']
+        except Exception as error:
+            debug.warning('could not look up the next game: {0}'.format(error))
+            return None
+        kickoff = self._earliest_kickoff(events)
+        slot = [e for e in events
+                if datetime.fromisoformat(e['date'].replace('Z', '+00:00')) == kickoff]
+        if len(slot) != 1:
+            return None
+        competition = slot[0]['competitions'][0]
+        teams = {c['homeAway']: c['team']['abbreviation'] for c in competition['competitors']}
+        odds = (competition.get('odds') or [{}])[0]
+        # Our matchup's starters in it, per side (Yahoo only; None elsewhere)
+        starters = {'user': None, 'opp': None}
+        lookup = getattr(self.api, 'starter_counts', None)
+        if lookup is not None:
+            try:
+                counts = lookup()
+                for side in starters:
+                    starters[side] = sum(counts[side].get(team, 0) for team in teams.values())
+            except Exception as error:
+                debug.warning('could not look up starters: {0}'.format(error))
+        return {
+            'league': 'nfl',
+            'away': teams.get('away', '?'),
+            'home': teams.get('home', '?'),
+            'neutral': competition.get('neutralSite', False),
+            'kickoff': kickoff,
+            'spread': odds.get('details'),  # e.g. "GB -4.5", or "EVEN"
+            'over_under': odds.get('overUnder'),
+            'user_starters': starters['user'],
+            'opp_starters': starters['opp'],
+        }
+
+    def mlb_game(self, team):
+        # `team`'s MLB game while it's in progress, None otherwise or if ESPN
+        # can't be reached
+        try:
+            events = requests.get(MLB_URL, timeout=10).json().get('events', [])
+        except Exception as error:
+            debug.warning('could not look up MLB scores: {0}'.format(error))
+            return None
+        for event in events:
+            competition = event['competitions'][0]
+            sides = {c['homeAway']: c for c in competition['competitors']}
+            if (self._event_state(event) != 'in'
+                    or team not in {c['team']['abbreviation'] for c in sides.values()}):
+                continue
+            situation = competition.get('situation') or {}
+            return {
+                'league': 'mlb',
+                'away': sides['away']['team']['abbreviation'],
+                'home': sides['home']['team']['abbreviation'],
+                'away_score': int(sides['away'].get('score') or 0),
+                'home_score': int(sides['home'].get('score') or 0),
+                'inning': event['status']['type']['shortDetail'],  # e.g. "Bot 7th"
+                'outs': situation.get('outs'),
+                'bases': [situation.get(b, False) for b in ('onFirst', 'onSecond', 'onThird')],
+            }
+        return None
+
+    @staticmethod
+    def team_logo(league, abbr):
+        # Path to an ESPN team logo, downloaded the first time it's asked for;
+        # None if ESPN doesn't have one
+        path = 'logos/espn_{0}_{1}.png'.format(league, abbr.lower())
+        if os.path.exists(path):
+            return path
+        for url in LOGO_URLS:
+            try:
+                response = requests.get(url.format(league, abbr.lower()), timeout=10)
+            except Exception as error:
+                debug.warning('could not fetch {0} logo: {1}'.format(abbr, error))
+                return None
+            if response.ok:
+                with open(path, 'wb') as logo:
+                    logo.write(response.content)
+                return path
+        return None
 
     def week_finished(self):
         # True once every game with one of our matchup's starters is final this

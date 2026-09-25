@@ -19,6 +19,14 @@ SCROLL_PAUSE = 6
 LEAGUE_EVERY = 30
 LEAGUE_SHOW = 8
 LEAGUE_FLASH = 5
+# The next NFL game, when it has its kickoff slot to itself: seconds between
+# looks at it and how long it stays up
+NEXT_GAME_EVERY = 60
+NEXT_GAME_SHOW = 6
+# An MLB team to show while it's playing: seconds between looks and how long it stays up
+MLB_TEAM = 'PHI'
+MLB_EVERY = 45
+MLB_SHOW = 8
 # How often to ask ESPN whether the week's last game is over, and the flash then
 WEEK_CHECK_EVERY = 60
 WEEK_OVER_FLASHES = 5
@@ -61,6 +69,9 @@ class MainRenderer:
         self._league_scores = {}
         self._league_changed = set()  # changes not yet shown
         self._league_shown_at = t.time()
+        self._next_game_shown_at = t.time()
+        self._mlb_shown_at = t.time()
+        self._team_logos = {}  # (league, abbr) -> logo image, or None if there isn't one
         # Week in which a game was seen unfinished; cleared once its end is celebrated
         self._games_live_week = None
         self._week_checked_at = 0
@@ -149,6 +160,103 @@ class MainRenderer:
         self._league_changed = set()
         self._league_shown_at = t.time()
 
+    def _team_logo(self, league, abbr):
+        """An ESPN team logo on black at logo size, or None if there isn't one."""
+        key = (league, abbr)
+        if key not in self._team_logos:
+            path = self.data.team_logo(league, abbr)
+            logo = None
+            if path:
+                try:
+                    art = Image.open(path).convert('RGBA')
+                    # Trim ESPN's transparent padding so the logo fills its box
+                    art = art.crop(art.getbbox() or (0, 0) + art.size)
+                    art.thumbnail((self.avsize, self.avsize), Image.LANCZOS)
+                    logo = Image.new('RGB', (self.avsize, self.avsize))
+                    logo.paste(art, ((self.avsize - art.width) // 2,
+                                     (self.avsize - art.height) // 2), art)
+                except Exception as error:
+                    debug.warning('could not load {0} logo: {1}'.format(abbr, error))
+            self._team_logos[key] = logo
+        return self._team_logos[key]
+
+    def _draw_team_logos(self, league, away, home, y):
+        """Away logo on the left, home on the right, or their codes if there's no logo."""
+        for abbr, x in ((away, 0), (home, self.width - self.avsize)):
+            logo = self._team_logo(league, abbr)
+            if logo is not None:
+                self.image.paste(logo, (x, y))
+            else:
+                text_w = self.font_vs.getbbox(abbr)[2]
+                self.draw.text((x + (self.avsize - text_w) // 2, y + 6), abbr,
+                               fill=(255, 255, 255), font=self.font_vs)
+
+    def _centre(self, text, y, colour, font=None):
+        font = font or self.font_mini
+        self.draw.text((center_text(font.getbbox(text)[2], 32), y), text, fill=colour, font=font)
+
+    def _new_screen(self):
+        self.image = Image.new('RGB', (self.width, self.height))
+        self.draw = ImageDraw.Draw(self.image)
+
+    def _draw_next_game(self, game, seconds):
+        """Show the next NFL game: kickoff, logos, our starters in it, spread and over/under."""
+        self._new_screen()
+        grey = (110, 110, 110)
+        # Same frame as the live view: text row on top, logos at y=6, text row at y=25
+        self._centre(self._kickoff_label(game['kickoff']), 0, grey)
+        self._draw_team_logos('nfl', game['away'], game['home'], 6)
+        self._centre('VS' if game['neutral'] else 'AT', 7, grey)
+        # How many of each side's starters play in it, once either has any
+        if game['user_starters'] or game['opp_starters']:
+            self._centre('ME {0}'.format(game['user_starters']), 13, (165, 200, 50))
+            self._centre('OPP {0}'.format(game['opp_starters']), 19, (255, 44, 44))
+        spread = game['spread'] or 'NO LINE'
+        self.draw.text((0, 25), spread, fill=(255, 165, 0), font=self.font_mini)
+        if game['over_under'] is not None:
+            total = '{0:g}'.format(game['over_under'])
+            # Drop the "O/U" label rather than crowd a long spread
+            for text in ('O/U ' + total, 'O' + total):
+                text_w = self.font_mini.getbbox(text)[2]
+                if self.font_mini.getbbox(spread)[2] + 3 + text_w <= self.width:
+                    self.draw.text((self.width - text_w, 25), text, fill=grey, font=self.font_mini)
+                    break
+        self._frame = self.image
+        self._show(self._frame)
+        self._hold(seconds)
+        self._new_screen()
+
+    def _draw_mlb_game(self, game, seconds):
+        """Show a live MLB game: inning, logos, runners on base, outs and the score."""
+        self._new_screen()
+        # "Bot 7th" -> "BOT 7"
+        words = game['inning'].split()
+        inning = game['inning'].upper()
+        if len(words) == 2 and words[1][:-2].isdigit():
+            inning = '{0} {1}'.format(words[0].upper(), words[1][:-2])
+        self._centre(inning, 0, (255, 255, 255))
+        self._draw_team_logos('mlb', game['away'], game['home'], 6)
+        # Bases as a diamond: second on top, first to the right, third to the left
+        lit, unlit = (255, 215, 0), (60, 60, 60)
+        for on, (x, y) in zip(game['bases'], ((36, 13), (31, 8), (26, 13))):
+            self.draw.rectangle((x, y, x + 2, y + 2), fill=lit if on else unlit)
+        if game['outs'] is not None:
+            for i in range(3):
+                x = 26 + i * 5
+                self.draw.rectangle((x, 20, x + 1, 21),
+                                    fill=(255, 44, 44) if i < game['outs'] else unlit)
+        # Scores under their logos; the trailing side greyed like the league list
+        for score, other, x in ((game['away_score'], game['home_score'], 0),
+                                (game['home_score'], game['away_score'], self.width - self.avsize)):
+            text = str(score)
+            colour = (110, 110, 110) if score < other else (255, 255, 255)
+            text_w = self.font_score.getbbox(text)[2]
+            self.draw.text((x + (self.avsize - text_w) // 2, 25), text, fill=colour, font=self.font_score)
+        self._frame = self.image
+        self._show(self._frame)
+        self._hold(seconds)
+        self._new_screen()
+
     def _check_week_over(self):
         """Flash the screen once when the week's last NFL game goes final."""
         if t.time() - self._week_checked_at < WEEK_CHECK_EVERY:
@@ -234,13 +342,18 @@ class MainRenderer:
                 debug.info('Off season state')
                 self.__render_off_season()
 
-    def _draw_standby(self, kickoff):
+    @staticmethod
+    def _kickoff_label(kickoff):
+        # "THU 8:15PM", in the Pi's local time
         local = kickoff.astimezone()
-        label = 'NEXT: {0} {1}:{2:02d}{3}'.format(
+        return '{0} {1}:{2:02d}{3}'.format(
             local.strftime('%a').upper(),
             local.hour % 12 or 12,
             local.minute,
             'AM' if local.hour < 12 else 'PM')
+
+    def _draw_standby(self, kickoff):
+        label = 'NEXT: ' + self._kickoff_label(kickoff)
         self.image = Image.new('RGB', (self.width, self.height))
         self.draw = ImageDraw.Draw(self.image)
         pos = center_text(self.font_mini.getbbox(label)[2], 32)
@@ -428,12 +541,23 @@ class MainRenderer:
                 self._note_league_changes(games)
                 mine_changed = (matchup['user_score'] != user_score
                                 or matchup['opp_score'] != opp_score)
-                # A change in our own game always gets the screen first
-                if games and not mine_changed:
-                    if self._league_changed:
+                # A change in our own game always gets the screen first, and
+                # at most one of these shows between looks at our matchup
+                if not mine_changed:
+                    if games and self._league_changed:
                         self._draw_league(games, LEAGUE_FLASH)
-                    elif t.time() - self._league_shown_at >= LEAGUE_EVERY:
+                    elif games and t.time() - self._league_shown_at >= LEAGUE_EVERY:
                         self._draw_league(games, LEAGUE_SHOW)
+                    elif t.time() - self._mlb_shown_at >= MLB_EVERY:
+                        self._mlb_shown_at = t.time()
+                        mlb_game = self.data.mlb_game(MLB_TEAM)
+                        if mlb_game:
+                            self._draw_mlb_game(mlb_game, MLB_SHOW)
+                    elif t.time() - self._next_game_shown_at >= NEXT_GAME_EVERY:
+                        self._next_game_shown_at = t.time()
+                        next_game = self.data.next_solo_game()
+                        if next_game:
+                            self._draw_next_game(next_game, NEXT_GAME_SHOW)
                 # --- Team names (live view), each above its own logo ---
                 _opp_name = self._display_name(matchup, 'opp')
                 _user_name = self._display_name(matchup, 'user')

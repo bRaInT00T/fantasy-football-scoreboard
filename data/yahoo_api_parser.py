@@ -30,6 +30,7 @@ class YahooFantasyInfo():
         self.game_id = game_id
         self.week = week
         self.matchup_team_keys = []
+        self.user_team_key = None
         self._starters = None
         self._starters_at = 0
         self.auth_info = {"consumer_key": yahoo_consumer_key,
@@ -248,6 +249,7 @@ class YahooFantasyInfo():
             if any(side['mine'] for side in sides):
                 matchup[m] = all_matchups[m]
                 self.matchup_team_keys = [side['key'] for side in sides]
+                self.user_team_key = next(side['key'] for side in sides if side['mine'])
             else:
                 league.append(sides)
         matchup_info = {'league': league}
@@ -320,10 +322,17 @@ class YahooFantasyInfo():
 
     def starting_nfl_teams(self):
         """NFL teams (ESPN codes) with a starter from either side of our matchup."""
+        counts = self.starter_counts()
+        return set(counts['user']) | set(counts['opp'])
+
+    def starter_counts(self):
+        """Starters per NFL team (ESPN codes) for each side of our matchup,
+        as {'user': {'GB': 2, ...}, 'opp': {...}}."""
         if self._starters is not None and time.time() - self._starters_at < STARTERS_TTL:
             return self._starters
-        teams = set()
+        counts = {'user': {}, 'opp': {}}
         for key in self.matchup_team_keys:
+            side = counts['user' if key == self.user_team_key else 'opp']
             self.refresh_access_token()
             url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{key}/roster;week={self.week}"
             response = self.oauth.session.get(url, params={'format': 'json'})
@@ -346,9 +355,10 @@ class YahooFantasyInfo():
                 if slot in NON_STARTING_SLOTS:
                     continue
                 team = (info.get('editorial_team_abbr') or '').upper()
-                teams.add(YAHOO_TO_ESPN_TEAM.get(team, team))
-        self._starters, self._starters_at = teams, time.time()
-        return teams
+                team = YAHOO_TO_ESPN_TEAM.get(team, team)
+                side[team] = side.get(team, 0) + 1
+        self._starters, self._starters_at = counts, time.time()
+        return counts
 
     def get_avatars(self, teams):
         self.refresh_access_token()
